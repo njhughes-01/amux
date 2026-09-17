@@ -2342,6 +2342,20 @@ async fn steering_queue_check(state: &AppState) -> Vec<InvariantResult> {
         let block_reason = crate::api::session_verbs::lane_block_reason(&session)
             .await
             .map(str::to_string);
+        // AF-219: the report's "active"/"idle" split cannot name "waiting on a
+        // human at a selector" -- an active report has no staleness bound,
+        // since its only exit is the turn ending, and a turn blocked on a
+        // human never ends. Only worth the extra pane scrape in the one
+        // combination the report vocabulary cannot answer: routable
+        // (block_reason is None) and not self-reported idle. Every other row
+        // already has a decisive answer and does not pay this cost.
+        let selector_wait = if block_reason.is_none() && !idle {
+            let pane = crate::api::session_verbs::tmux_capture(&session, 12).await;
+            crate::api::session_verbs::detect_claude_status(&pane) == "waiting"
+                && !crate::api::session_verbs::is_rate_limit_menu(&pane)
+        } else {
+            false
+        };
         items.push(checks::QueuedItem {
             queue: "steering".into(),
             target: session,
@@ -2349,6 +2363,7 @@ async fn steering_queue_check(state: &AppState) -> Vec<InvariantResult> {
             target_idle: idle,
             block_reason,
             idle_since,
+            target_selector_wait: selector_wait,
         });
     }
 

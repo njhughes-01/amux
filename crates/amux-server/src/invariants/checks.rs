@@ -1387,7 +1387,35 @@ pub fn queue_has_live_consumer(
                     );
                 }
             }
-            // A deep queue behind a BUSY worker (routable, not idle) is correct.
+            // A deep queue behind a BUSY worker (routable, not idle) is correct
+            // -- UNLESS the pane itself shows the lane parked at a selector
+            // (AF-219): the report says "active" because a turn blocked on a
+            // human never ends, so nothing here can tell "genuinely busy" from
+            // "waiting on a person" without the scrape. That is the missing
+            // state cell; this is the narrow fix (option 3 of 3 on the card),
+            // not a new report vocabulary cell (option 1, not built here).
+            None if it.target_selector_wait && age > stale_after_s => out.push(
+                InvariantResult::fail(
+                    ID,
+                    format!(
+                        "a queue behind a lane reporting 'active' drains within {stale_after_s:.0}s, \
+                         or the lane is genuinely busy"
+                    ),
+                    format!(
+                        "undelivered for {age:.0}s; the report says active but the pane shows the \
+                         lane parked at a selector, waiting on a HUMAN decision -- not a turn that \
+                         will end on its own"
+                    ),
+                )
+                .entity(&it.target)
+                .evidence(json!({
+                    "target": it.target, "queue": it.queue, "age_s": age,
+                    "class": "waiting-on-human",
+                    "incident": "AF-219: a lane parked on a human decision reads as an ordinary \
+                                 busy worker because 'active' reports have no staleness bound and \
+                                 no cell for 'waiting on a person'",
+                })),
+            ),
             None => out.push(InvariantResult::pass(ID).entity(&it.target)),
         }
     }
@@ -1414,6 +1442,18 @@ pub struct QueuedItem {
     /// because those are different clocks and only one of them matches what the
     /// check claims to test (AMUX-3572).
     pub idle_since: Option<f64>,
+    /// True when a live pane scrape shows the target parked at a selector
+    /// (AskUserQuestion, a menu — `detect_claude_status == "waiting"`, rate-limit
+    /// menus excluded since those already carry their own `block_reason`), taken
+    /// at the SAME moment as `target_idle`. Only meaningful when `block_reason`
+    /// is `None` and `target_idle` is false: that is the one combination the
+    /// report vocabulary cannot name (AF-219) — the report says "active" because
+    /// a turn blocked on a human never ends, so the Stop hook that would flip it
+    /// to idle never fires, and `active` has no staleness bound the way `idle`
+    /// does. Without this field a lane parked on a human decision reads as an
+    /// ordinary busy worker with a draining queue, and the sender is never told
+    /// their message is stuck.
+    pub target_selector_wait: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -5141,6 +5181,7 @@ mod negative_controls {
             target_idle: true,
             block_reason: None,
             idle_since: None,
+            target_selector_wait: false,
         }];
         let rs = queue_has_live_consumer(&items, 7_560.0, 300.0, 3_600.0); // 2h6m, the real age
         assert!(rs.iter().any(|r| r.status == Status::Fail), "must detect the dead consumer");
@@ -5162,6 +5203,7 @@ mod negative_controls {
             target_idle: false,
             block_reason: Some(reason.into()),
             idle_since: None,
+            target_selector_wait: false,
         };
         // Inside the reaper's deadline: sanctioned wait, pass.
         let rs = queue_has_live_consumer(&[mk("no-env-file", 6_000.0)], 7_560.0, 300.0, 3_600.0);
@@ -5231,6 +5273,7 @@ mod negative_controls {
             target_idle: true, // carries a stale, never-decaying idle report (AMUX-2646)
             block_reason: Some("no-env-file".into()),
             idle_since: None,
+            target_selector_wait: false,
         }];
         // Post-AMUX-3473: the ghost still fails, but only PAST the reaper's
         // deadline (2h6m old vs a 1h deadline here), and the class names the
@@ -5436,12 +5479,47 @@ mod negative_controls {
             target_idle: false, // mid-turn: queueing is the POINT
             block_reason: None,
             idle_since: None,
+            target_selector_wait: false, // pane genuinely shows a live turn, not a selector
         }];
         let rs = queue_has_live_consumer(&items, 7_560.0, 300.0, 3_600.0);
         assert!(
             rs.iter().all(|r| r.status == Status::Pass),
             "a deep queue behind a busy worker is correct, not a fault"
         );
+    }
+
+    /// AF-219: the same "reports active, not idle, no block_reason" shape as the
+    /// control above, but the pane scrape shows the lane parked at a selector
+    /// instead of genuinely mid-turn. The report cannot tell these apart (an
+    /// `active` report has no staleness bound, since the only exit is the turn
+    /// ending, and a turn blocked on a human never ends) -- this is the missing
+    /// branch, verified against both directions so the mutation is real:
+    /// flipping `target_selector_wait` to false must fall through to the PASS
+    /// above, not fail regardless of the field.
+    #[test]
+    fn a_lane_parked_on_a_human_decision_is_not_a_busy_worker() {
+        let items = vec![QueuedItem {
+            queue: "steering".into(),
+            target: "amux".into(),
+            queued_at: 0.0,
+            target_idle: false, // report still says "active": the Stop hook never fired
+            block_reason: None,
+            idle_since: None,
+            target_selector_wait: true, // but the pane shows a live AskUserQuestion selector
+        }];
+        // Inside the delivery loop's own tick window: not yet worth surfacing.
+        let rs = queue_has_live_consumer(&items, 120.0, 300.0, 3_600.0);
+        assert!(
+            rs.iter().all(|r| r.status == Status::Pass),
+            "a selector wait under the stale threshold is not yet a finding: {rs:?}"
+        );
+        // Past it -- the 08-25 incident's own shape (5.5h old, still parked).
+        let rs = queue_has_live_consumer(&items, 7_560.0, 300.0, 3_600.0);
+        let f = rs
+            .iter()
+            .find(|r| r.status == Status::Fail)
+            .expect("a lane parked on a human past the deadline must surface, not read as busy");
+        assert_eq!(f.evidence["class"].as_str(), Some("waiting-on-human"), "{}", f.evidence);
     }
 
     /// An INDENTED block in a doc comment is a Markdown code block, so rustdoc
@@ -5519,6 +5597,7 @@ mod negative_controls {
             target_idle: true,
             block_reason: None,
             idle_since: Some(idle_since),
+            target_selector_wait: false,
         };
 
         // Just went idle after a long turn: the queue has had 5s to drain.
