@@ -224,6 +224,28 @@ impl Store {
             // that could be shedding load. Five seconds keeps a generous margin
             // over any legitimate contention while cutting the pin by 6x.
             .connection_timeout(std::time::Duration::from_secs(5))
+            // AND THE SAME KNOB GOVERNS POOL STARTUP, which the paragraph above
+            // did not account for (AMUX-4739).
+            //
+            // `Pool::build` calls `wait_for_initialization`, which waits for
+            // `min_idle.unwrap_or(max_size)` connections to exist and bounds
+            // that wait by THIS timeout (r2d2 0.8.10 lib.rs:391-395). min_idle
+            // was unset, so opening a store waited for `available_parallelism`
+            // connections. Cutting 30s -> 5s to bound acquisition therefore made
+            // startup six times more likely to fail outright, and it fails as
+            // `Store::open` returning Err("timed out waiting for connection"),
+            // which reads as a broken database rather than a busy one.
+            //
+            // MEASURED, 2026-09-17: a full `cargo test -p amux-server --lib` on
+            // an unmodified origin/main produced 39 of these and 43 failed tests
+            // across modules that share nothing but this call. A second run
+            // failed a DIFFERENT 29, which is what made it look like unrelated
+            // flakiness for as long as it did.
+            //
+            // One connection is enough to serve the first reader; the pool still
+            // grows to max_size on demand. This changes what `open` WAITS FOR,
+            // not how many connections a loaded server ends up with.
+            .min_idle(Some(1))
             .build(manager)?;
 
         Ok(Store {
@@ -665,6 +687,68 @@ fn apply_write(
 
 /// Shared handle used by API state.
 pub type SharedStore = Arc<Store>;
+
+#[cfg(test)]
+mod amux4739_pool_startup_tests {
+    use super::*;
+
+    /// AMUX-4739: opening the store must not wait for a FULL read pool.
+    ///
+    /// `Pool::build` waits for `min_idle.unwrap_or(max_size)` connections and
+    /// bounds that wait by `connection_timeout` (r2d2 0.8.10, lib.rs:391-395).
+    /// With min_idle unset that is every connection, so AF-640's 5s acquisition
+    /// timeout silently became a 5s STARTUP budget for `available_parallelism`
+    /// connections.
+    ///
+    /// The failure mode is the expensive part: `Store::open` returns
+    /// Err("timed out waiting for connection"), so a busy machine presents as a
+    /// broken database. Measured on an unmodified origin/main, one full lib run
+    /// produced 39 of these across modules sharing nothing but this call, and a
+    /// second run failed a different set, which is why it read as flakiness.
+    #[test]
+    fn opening_the_store_waits_for_one_connection_not_the_whole_pool() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("startup.db")).unwrap();
+
+        let min_idle = store.read_pool.min_idle();
+        let max_size = store.read_pool.max_size();
+        assert_eq!(
+            min_idle,
+            Some(1),
+            "open must block on a single connection; None means max_size ({max_size}) \
+             connections inside the {:?} connection_timeout",
+            store.read_pool.connection_timeout()
+        );
+        // The point is the RELATIONSHIP, not the literal. A min_idle equal to
+        // max_size would satisfy "is set" while restoring the whole defect.
+        assert!(
+            min_idle.is_some_and(|m| m < max_size.max(2)),
+            "min_idle {min_idle:?} is not below max_size {max_size}; startup would still \
+             wait for the full pool"
+        );
+        // The pool must still be ABLE to grow, or this traded a startup stall
+        // for a permanent one-connection bottleneck.
+        assert!(
+            max_size > 1,
+            "max_size {max_size} leaves no room to grow beyond the startup minimum"
+        );
+    }
+
+    /// The acquisition bound AF-640 set must survive this change. Startup and
+    /// acquisition read the same field, so it is exactly the kind of pair where
+    /// fixing one silently relaxes the other.
+    #[test]
+    fn the_acquisition_timeout_af640_set_is_unchanged() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("timeout.db")).unwrap();
+        assert_eq!(
+            store.read_pool.connection_timeout(),
+            std::time::Duration::from_secs(5),
+            "AF-640 cut this from 30s to 5s because a blocked acquire pins a tokio \
+             worker; raising it to make startup easier would undo that"
+        );
+    }
+}
 
 #[cfg(test)]
 mod amux4744_write_queue_tests {

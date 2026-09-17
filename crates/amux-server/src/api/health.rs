@@ -525,6 +525,55 @@ pub struct StoreProbeProgress {
     /// value here with a small `write_wait_max_ms` means the writer was never
     /// the bottleneck and the blocking pool was.
     pub blocking_dispatch_max_ms: u64,
+    /// How long the probe is given before `store` is reported as "hung".
+    ///
+    /// PUBLISHED BECAUSE "hung" IS A VERDICT ABOUT A BUDGET, NOT ABOUT THE
+    /// STORE (AMUX-4739). The probe is cancelled at this deadline and the
+    /// payload then says `store: "hung"` with a 503, which reads as a dead
+    /// database. On 2026-09-16 that reading sent an investigation after
+    /// synchronous `Store::read` and a ~440-call-site refactor; the store was
+    /// answering /api/board in 1.6s at the same moment.
+    pub probe_budget_ms: u64,
+    /// How long the most recent probe that FINISHED actually took, in
+    /// milliseconds, or None if none has finished since start.
+    ///
+    /// This is the number that makes "hung" legible. A cancelled probe keeps
+    /// running, so the server learns its real duration a moment later and
+    /// nothing used to publish it. Read beside `probe_budget_ms`:
+    /// 250 budget with a 1044ms last completion is a slow probe on a loaded
+    /// box; 250 budget with a 68000ms last completion is the store in trouble.
+    /// Both render as `store: "hung"`, and before this they were
+    /// indistinguishable to every reader.
+    pub last_completion_ms: Option<u64>,
+}
+
+/// The probe's budget, named once. It was written as a bare `250` in two
+/// places: the cancellation timeout and the `slow_probe_completed` threshold.
+/// Those two must agree by construction, since the second exists to report
+/// overruns of the first.
+const PROBE_BUDGET_MS: u64 = 250;
+
+/// Duration of the most recent probe that ran to completion, OFFSET BY ONE so
+/// that zero can mean "none has finished yet".
+///
+/// A plain millisecond count cannot express that: a probe that never completed
+/// and one that completed in under a millisecond both read 0, and those are
+/// opposite facts. Flooring the value at 1 was the first attempt and it is
+/// worse than it looks — it is unreachable on any real probe (opening and
+/// querying the store always costs at least a millisecond), so it could not be
+/// tested, and a guard no test can reach is a guard nobody can trust.
+static LAST_PROBE_COMPLETION_RAW: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Store side of the offset. Called by the probe; paired with `decode_completion`.
+fn encode_completion(ms: u64) -> u64 {
+    ms.saturating_add(1)
+}
+
+/// Read side of the offset. `None` means no probe has completed since start,
+/// which is distinct from `Some(0)`, a probe that completed immediately.
+fn decode_completion(raw: u64) -> Option<u64> {
+    raw.checked_sub(1)
 }
 
 // Monotonic, process-local timestamps: zero is reserved for "not measured".
@@ -576,17 +625,23 @@ pub async fn health(State(state): State<AppState>) -> (StatusCode, Json<Health>)
                 // A timed-out JoinHandle keeps running, but used to discard
                 // every eventual success. The watchdog then inferred a dead
                 // database from three slow samples and killed a serving app.
+                // RECORDED WHETHER OR NOT THE HTTP CALLER IS STILL LISTENING.
+                // A cancelled probe keeps running, so this is the only place
+                // the real duration of a slow probe is ever known.
+                let took_ms = probe_started.elapsed().as_millis() as u64;
+                LAST_PROBE_COMPLETION_RAW
+                    .store(encode_completion(took_ms), std::sync::atomic::Ordering::Relaxed);
                 if board.ok {
                     store.health_probe_last_success.store(probe_clock_ms(), std::sync::atomic::Ordering::Relaxed);
-                    if probe_started.elapsed() >= std::time::Duration::from_millis(250) {
+                    if took_ms >= PROBE_BUDGET_MS {
                         tracing::info!(target:"health", verdict="slow_probe_completed",
-                            measured=true, elapsed_ms=probe_started.elapsed().as_millis() as u64,
+                            measured=true, elapsed_ms=took_ms, budget_ms=PROBE_BUDGET_MS,
                             "store probe completed after the HTTP deadline; readiness history retained");
                     }
                 }
                 Ok((rev, board))
             });
-            match tokio::time::timeout(std::time::Duration::from_millis(250), task).await {
+            match tokio::time::timeout(std::time::Duration::from_millis(PROBE_BUDGET_MS), task).await {
                 Ok(Ok(result)) => result,
                 Ok(Err(_)) => Err("probe_task_failed"),
                 Err(_) => Err("probe_deadline_exceeded"),
@@ -611,6 +666,10 @@ pub async fn health(State(state): State<AppState>) -> (StatusCode, Json<Health>)
     let store_probe = StoreProbeProgress {
         last_success_age_ms: age(state.store.health_probe_last_success.load(std::sync::atomic::Ordering::Relaxed)),
         in_flight_age_ms: age(state.store.health_probe_started.load(std::sync::atomic::Ordering::Relaxed)),
+        probe_budget_ms: PROBE_BUDGET_MS,
+        last_completion_ms: decode_completion(
+            LAST_PROBE_COMPLETION_RAW.load(std::sync::atomic::Ordering::Relaxed),
+        ),
         write_inflight: state.store.write_inflight.load(std::sync::atomic::Ordering::Relaxed),
         write_wait_max_ms: state.store.write_wait_max_ms.load(std::sync::atomic::Ordering::Relaxed),
         blocking_dispatch_max_ms: state
@@ -1118,5 +1177,163 @@ mod admission_tests {
             "the gate is DENYING on this host right now — mem: {:?}",
             mem_health()
         );
+    }
+}
+
+#[cfg(test)]
+mod amux4739_probe_budget_tests {
+    use super::*;
+    use std::sync::atomic::Ordering;
+
+    /// AMUX-4739: `store: "hung"` is a verdict about a BUDGET, and the payload
+    /// has to say what the budget was.
+    ///
+    /// The probe is cancelled at `PROBE_BUDGET_MS` and the payload then reports
+    /// `store: "hung"` with a 503. That reads as a dead database. Measured on
+    /// 2026-09-17, the probe's own `slow_probe_completed` log says what really
+    /// happened: before the writer fix the median slow probe finished in
+    /// 68,481ms; after it, 1,044ms with nothing over 5s. Same "hung" label for
+    /// both, and a reader could not tell them apart from the payload.
+    ///
+    /// COST, concrete: that label sent an investigation after synchronous
+    /// `Store::read` and a ~440-call-site refactor, while /api/board was
+    /// answering in 1.6s at the same moment.
+    #[test]
+    fn the_probe_budget_is_published_so_hung_can_be_read_against_something() {
+        // The two uses of the budget must be the same number BY CONSTRUCTION.
+        // They were two bare `250` literals: the cancellation timeout, and the
+        // threshold for reporting an overrun of that timeout. A drift between
+        // them would make `slow_probe_completed` fire on probes that were never
+        // cancelled, or stay silent on ones that were.
+        let src = include_str!("health.rs");
+        let body = src
+            .split_once("\npub async fn health(")
+            .expect("the health handler exists")
+            .1;
+        let body = body.split_once("\n}\n").expect("its closing brace").0;
+        let body: String = body
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            body.contains("timeout") && body.contains("try_acquire_owned"),
+            "the scan is not reading the health handler; {} chars of something else",
+            body.len()
+        );
+        assert!(
+            !body.contains("from_millis(250)"),
+            "the probe budget is a bare literal again; it must be PROBE_BUDGET_MS so the \
+             cancellation and the overrun report cannot drift apart"
+        );
+        assert!(
+            body.contains("PROBE_BUDGET_MS"),
+            "the handler must use the named budget"
+        );
+    }
+
+    /// The gauge has to distinguish "no probe has finished" from "a probe
+    /// finished instantly". Both are zero in the atomic, which is why the
+    /// published field is an Option and completions are floored at 1ms.
+    ///
+    /// DRIVEN THROUGH THE REAL HANDLER, after a first version of this cell
+    /// reimplemented the `0 => None` match locally and asserted on its own copy.
+    /// It passed under a mutation that deleted the flooring from the shipped
+    /// path, because the shipped path was never executed. A cell that restates
+    /// the logic it is checking cannot fail when that logic changes.
+    #[tokio::test]
+    async fn an_instant_probe_publishes_a_duration_rather_than_an_absence() {
+        LAST_PROBE_COMPLETION_RAW.store(0, Ordering::Relaxed);
+        let dir = tempfile::tempdir().unwrap();
+        let state = AppState {
+            store: std::sync::Arc::new(
+                crate::db::Store::open(&dir.path().join("h.db")).unwrap(),
+            ),
+            started: std::time::Instant::now(),
+            build_hash: "test".into(),
+            auth_token: None,
+            reconciled: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
+        };
+
+        let (_code, Json(first)) = health(State(state.clone())).await;
+        // A fresh store probes in well under a millisecond, which is exactly
+        // the case that collapses into "nothing has ever completed" without the
+        // flooring. So this is the discriminating input, not a convenient one.
+        assert_eq!(
+            first.store, "ok",
+            "the probe must have completed for this cell to say anything"
+        );
+        assert!(
+            first.store_probe.last_completion_ms.is_some(),
+            "a probe completed, so its duration must be published; None claims none ever ran"
+        );
+        assert_eq!(
+            first.store_probe.probe_budget_ms, PROBE_BUDGET_MS,
+            "the budget the verdict is measured against must be in the payload"
+        );
+    }
+
+    /// The offset that keeps "no probe has completed" apart from "a probe
+    /// completed in under a millisecond".
+    ///
+    /// These are the FUNCTIONS THE HANDLER CALLS, not a restatement of them.
+    /// The previous version of this cell inlined its own `0 => None` match and
+    /// stayed green while a mutation deleted the real one.
+    #[test]
+    fn a_zero_millisecond_probe_is_not_reported_as_no_probe() {
+        assert_eq!(
+            decode_completion(0),
+            None,
+            "nothing has completed since start"
+        );
+        // The discriminating case, and the one a floor gets wrong: a probe that
+        // finished in under a millisecond DID happen and must publish 0, not
+        // absence.
+        assert_eq!(
+            decode_completion(encode_completion(0)),
+            Some(0),
+            "a sub-millisecond probe completed; None would claim none ever did"
+        );
+        // And the offset must not distort a real duration, which a floor also
+        // did: max(1) silently rewrites 0 to 1.
+        for ms in [1u64, 250, 1_044, 68_481] {
+            assert_eq!(
+                decode_completion(encode_completion(ms)),
+                Some(ms),
+                "the published duration must be the measured one, exactly"
+            );
+        }
+    }
+
+    /// The budget must be a real cap, not a value that happens to exceed every
+    /// observed probe. A budget above the slow-probe durations would never
+    /// cancel anything and the "hung" path would be dead code.
+    #[test]
+    fn the_budget_is_small_enough_to_actually_cancel_a_slow_probe() {
+        // MEASURED DURATIONS, not invented ones, run through the same decode
+        // the payload uses. Asserting a range on the constant alone is a
+        // tautology clippy rejects and it would be right to: that assertion
+        // cannot fail whatever the budget is set to.
+        //
+        // /api/health p50 on 2026-09-17 was 0.74ms. Slow probes: median 1044ms
+        // after the writer fix (2b4c247f), 68481ms before it.
+        let healthy_ms = [0u64, 1];
+        let slow_ms = [1_044u64, 68_481];
+        for ms in healthy_ms {
+            let published = decode_completion(encode_completion(ms)).expect("completed");
+            assert!(
+                published < PROBE_BUDGET_MS,
+                "a healthy {ms}ms probe must fit inside the {PROBE_BUDGET_MS}ms budget, \
+                 or the server reports itself hung while answering normally"
+            );
+        }
+        for ms in slow_ms {
+            let published = decode_completion(encode_completion(ms)).expect("completed");
+            assert!(
+                published > PROBE_BUDGET_MS,
+                "a measured slow probe of {ms}ms must exceed the {PROBE_BUDGET_MS}ms budget, \
+                 or the cancellation path this card is about is unreachable"
+            );
+        }
     }
 }
