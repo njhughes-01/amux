@@ -442,7 +442,7 @@ if [[ "$OS" == "Linux" ]] && command -v systemctl &>/dev/null; then
   # the repo copy (ships on save, same convention as the playwright wrapper
   # above), no separate ~/.local/bin copy to fall out of sync.
   envsubst '$BIN_DIR $SCRIPT_DIR' < "$SCRIPT_DIR/scripts/amux-worker-start.service.template" \
-    | sed "/^Environment=PATH=/a Environment=\"AMUX_HOME=$AMUX_HOME\"" \
+    | sed "/^Environment=PATH=/a EnvironmentFile=-$AMUX_HOME/server.env\nEnvironment=\"AMUX_HOME=$AMUX_HOME\"" \
     > "$SYSTEMD_DIR/amux-worker-start.service" || die "failed to create amux-worker-start.service"
   chmod +x "$SCRIPT_DIR/scripts/amux-start-worker.sh"
 
