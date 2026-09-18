@@ -1070,10 +1070,35 @@ fn trim_live_overlap(transcript: &str, live: &str) -> String {
         false
     };
     let ll: Vec<&str> = live.split('\n').collect();
-    let matches: Vec<usize> =
-        ll.iter().enumerate().filter(|(_, x)| in_transcript(&norm(x))).map(|(i, _)| i).collect();
-    if matches.len() >= 3 {
-        let after = matches[matches.len() - 1] + 1;
+    // SCAN FROM THE END (AMUX-4802/peek latency). This used to normalise and
+    // test EVERY live line, then use exactly two things: the count is at least
+    // three, and the LAST matching index. Both are answerable from the tail, so
+    // stop after the third match instead of walking the whole capture.
+    //
+    // It matters because `in_transcript` is O(transcript) per line: for lines
+    // of 24+ chars it scans every long transcript line doing containment in
+    // both directions. Measured on the live server with a 600-line peek, which
+    // is the shape CLAUDE.md tells every worker to use: 113.8ms with the trim
+    // against 50.6ms with `notrim=1`, so the trim was 55% of the request. At
+    // lines=5000 it was 688ms against 90ms, or 87%.
+    //
+    // Exactly equivalent, not an approximation: `found[0]` is the first match
+    // seen while descending, which is the maximum index, which is the old
+    // `matches[matches.len() - 1]`. And finding three while descending is the
+    // same predicate as the old `matches.len() >= 3`. When fewer than three
+    // exist this walks the whole capture exactly as before and falls through to
+    // the prompt-anchor path below.
+    let mut found: Vec<usize> = Vec::with_capacity(3);
+    for (i, x) in ll.iter().enumerate().rev() {
+        if in_transcript(&norm(x)) {
+            found.push(i);
+            if found.len() == 3 {
+                break;
+            }
+        }
+    }
+    if found.len() >= 3 {
+        let after = found[0] + 1;
         return ll[after.min(ll.len())..].join("\n").trim_start_matches('\n').to_string();
     }
 
@@ -26855,6 +26880,40 @@ CLAUDE-POSTFIX-COMPLETE
         // repeated line remains insufficient.
         assert_eq!(trim_live_overlap(prompt, &format!("{prompt}\nfresh after prompt")),
                    "fresh after prompt");
+    }
+
+    /// The overlap scan runs from the END and stops after three matches, which
+    /// is only equivalent to the old whole-capture scan if it keeps the
+    /// HIGHEST matching index rather than the third-from-last one.
+    ///
+    /// The old code collected every match and used `matches[len - 1]`. Reading
+    /// the wrong end of the early-exit buffer is the natural way to get this
+    /// wrong, and it is invisible in a capture where the last three overlapping
+    /// lines happen to be adjacent. So this fixture puts a GAP between the
+    /// third-from-last match and the last one: taking the wrong end would
+    /// re-emit `carried over from the transcript`, which the reader has already
+    /// seen, and that duplication is the exact symptom the trim exists to stop.
+    #[test]
+    fn the_overlap_scan_keeps_the_last_match_not_the_third_from_last() {
+        let shared: Vec<String> = (0..6)
+            .map(|i| format!("a shared transcript line number {i} long enough to anchor"))
+            .collect();
+        let transcript = format!(
+            "{}\ncarried over from the transcript and also long enough to anchor",
+            shared.join("\n")
+        );
+        // Three early matches, a gap of genuinely new text, then one more
+        // match, then the tail the caller should actually receive.
+        let live = format!(
+            "{}\n{}\n{}\nbrand new output line one\nbrand new output line two\n{}\nthe only fresh tail",
+            shared[0], shared[1], shared[2],
+            "carried over from the transcript and also long enough to anchor",
+        );
+        assert_eq!(
+            trim_live_overlap(&transcript, &live),
+            "the only fresh tail",
+            "must trim after the LAST overlapping line, not the third-from-last"
+        );
     }
 
     #[test]
