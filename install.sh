@@ -496,9 +496,9 @@ if [[ "$OS" == "Linux" ]] && command -v systemctl &>/dev/null; then
   echo "  ${DIM}systemctl --user start amux-server${RESET}"
   echo ""
   say "Optional Playwright MCP lanes (localhost-only; enable only lanes that use browser automation):"
-  shopt -s nullglob
+  shopt -s nullglob dotglob
   mcp_lane_files=("$AMUX_HOME/sessions"/*.env)
-  shopt -u nullglob
+  shopt -u nullglob dotglob
   if [ "${#mcp_lane_files[@]}" -eq 0 ]; then
     say "No registered lanes yet; after registering browser-automation lanes, re-run this installer to print their optional MCP enable commands."
   else
@@ -510,6 +510,7 @@ if [[ "$OS" == "Linux" ]] && command -v systemctl &>/dev/null; then
       mcp_port=$((mcp_port + 1))
     done
   fi
+  printf '%s playwright_mcp_hint registered_lanes=%s\n' "$(date -Is)" "${#mcp_lane_files[@]}" >> "$AMUX_HOME/logs/install.log"
   echo ""
   say "View logs: ${DIM}journalctl --user -u amux-server -f${RESET}"
   echo ""
