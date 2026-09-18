@@ -338,8 +338,14 @@ pub fn mounted_routes_answer(
         // here a reader cannot tell that from a route failing right now, and
         // AMUX-4674 read exactly this shape as "has not self-healed".
         let age_h = last_seen_age_h(r);
+        // "last CALLED", not "last failed". The number is the newest call in the
+        // group whatever its status, and that is the question a reader has here:
+        // a shape still taking traffic can dilute an old burst, a silent one
+        // cannot. Seen live within an hour of shipping the first wording, `, last
+        // 0h ago` sat beside a FAIL whose most recent call had SUCCEEDED, and it
+        // reads as "it failed 0h ago" — the exact misreading this card is about.
         let recency = match age_h {
-            Some(h) => format!(", last {h}h ago"),
+            Some(h) => format!(", last called {h}h ago"),
             None => String::new(),
         };
         out.push(
@@ -5889,9 +5895,14 @@ mod negative_controls {
         let fail = rs.iter().find(|r| r.status == Status::Fail).expect("still a finding");
         let age = fail.evidence["detail"]["last_seen_age_h"].as_f64().expect("an age");
         assert!((47.0..=49.0).contains(&age), "expected ~48h, got {age}");
+        // "last CALLED", not "last failed": the number is the newest call in the
+        // group whatever its status. The verb is load-bearing — without it the
+        // age reads as the age of the FAILURE, which is a different fact and the
+        // one a reader would act on.
         assert!(
-            fail.observed.contains("last 48h ago") || fail.observed.contains("48h ago"),
-            "the age belongs in the sentence a reader sees, not only in the evidence: {}",
+            fail.observed.contains("last called 48h ago"),
+            "the age belongs in the sentence a reader sees, and it has to say what \
+             it is the age OF: {}",
             fail.observed
         );
 
