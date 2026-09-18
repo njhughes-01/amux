@@ -65,6 +65,6 @@ PLAYWRIGHT_MCP_VERSION="${AMUX_PLAYWRIGHT_MCP_VERSION:-0.0.68}"
 exec npx -y "@playwright/mcp@${PLAYWRIGHT_MCP_VERSION}" \
   --port "$PORT" \
   --user-data-dir "$PROFILE" \
-  --host 0.0.0.0 \
+  --host "${AMUX_PLAYWRIGHT_MCP_HOST:-127.0.0.1}" \
   "${EXEC_ARGS[@]}" \
   "${CONFIG_ARGS[@]}"
