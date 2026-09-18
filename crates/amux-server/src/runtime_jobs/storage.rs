@@ -1061,10 +1061,21 @@ async fn checkpoint_wal(store: &crate::db::SharedStore, home: &Path) -> (Option<
     let size = |p: &Path| std::fs::metadata(p).ok().map(|m| m.len());
     let before = size(&wal);
     let t0 = std::time::Instant::now();
+    // `read_async`, NOT `write_async`, and that is the whole fix.
+    //
+    // Every write_async closure runs inside an Immediate transaction
+    // (db/mod.rs:612), and SQLite refuses a checkpoint inside one. The first
+    // version of this function used write_async and the log said so on the
+    // very first tick: `wal_checkpoint(TRUNCATE) failed error=database table
+    // is locked`. read_async hands out a POOLED connection that is not in a
+    // transaction, and those are opened read-write
+    // (SqliteConnectionManager::file with no read-only flag), so the pragma
+    // can actually do its work. The "read-only" in that pool's docstring is a
+    // convention about intent, not an enforced flag.
     let res = store
-        .write_async(move |conn| {
+        .read_async(move |conn| {
             conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")?;
-            Ok(crate::db::WriteOutcome { applied: false, events: vec![] })
+            Ok(())
         })
         .await;
     let after = size(&wal);
@@ -1114,14 +1125,26 @@ async fn maybe_vacuum(store: &crate::db::SharedStore, home: &Path) -> bool {
         }
     }
     let t0 = std::time::Instant::now();
+    // Same correction as checkpoint_wal above (AMUX-4811): VACUUM, like a
+    // checkpoint, cannot run inside a transaction, and write_async wraps every
+    // closure in an Immediate one (db/mod.rs:612). This path has therefore been
+    // failing for as long as it has existed. Nobody saw it because the marker
+    // below was written whether or not the work succeeded, so the next attempt
+    // was suppressed for another 24 hours and the log line said "VACUUM
+    // completed" only on a branch that never ran.
     let res = store
-        .write_async(move |conn| {
+        .read_async(move |conn| {
             conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")?;
             conn.execute_batch("VACUUM;")?;
-            Ok(crate::db::WriteOutcome { applied: false, events: vec![] })
+            Ok(())
         })
         .await;
-    let _ = std::fs::write(&marker, format!("{}", unix_now() as i64));
+    // ONLY on success. Writing it unconditionally turned a failure into a
+    // 24-hour silence, which is how a 4.16 GB database ended up carrying a
+    // 143 MB WAL with nothing in the log to explain it.
+    if res.is_ok() {
+        let _ = std::fs::write(&marker, format!("{}", unix_now() as i64));
+    }
     match res {
         Ok(_) => {
             tracing::info!(
@@ -1935,5 +1958,93 @@ mod tests {
         let (n, _) = prune_dir_by_age(dir.path(), 0, "AMUX_TEST");
         assert_eq!(n, 0, "0 disables the sweep entirely rather than deleting everything");
         assert!(dir.path().join("fresh.mp4").exists());
+    }
+
+    /// The WAL only shrinks when the checkpoint runs OUTSIDE a transaction,
+    /// which is why `checkpoint_wal` and `maybe_vacuum` use `read_async` rather
+    /// than `write_async` (AMUX-4811).
+    ///
+    /// This is the shape that shipped broken for as long as the job existed:
+    /// `write_async` wraps every closure in an Immediate transaction
+    /// (db/mod.rs:612), SQLite refuses to checkpoint inside one, and the only
+    /// evidence was a WARN nobody had written yet. A 4.16 GB production
+    /// database was carrying a 143 MB WAL when this was found.
+    ///
+    /// Both arms are asserted on purpose. Without the in-transaction arm this
+    /// test would still pass if someone moved the pragma back under
+    /// `write_async`, because the out-of-transaction arm alone proves only that
+    /// SQLite can truncate, never that the caller lets it.
+    #[test]
+    fn a_wal_checkpoint_only_truncates_outside_a_transaction() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("t.db");
+        let conn = rusqlite::Connection::open(&db).unwrap();
+        conn.pragma_update(None, "journal_mode", "WAL").unwrap();
+        conn.execute_batch("CREATE TABLE t(v BLOB);").unwrap();
+        let blob = vec![b'x'; 8192];
+        for _ in 0..400 {
+            conn.execute("INSERT INTO t(v) VALUES (?1)", [&blob]).unwrap();
+        }
+        let wal = dir.path().join("t.db-wal");
+        let size = || std::fs::metadata(&wal).map(|m| m.len()).unwrap_or(0);
+        let grown = size();
+        assert!(grown > 0, "the fixture must actually produce a WAL to truncate");
+
+        // INSIDE a transaction: refused, exactly as the shipped bug was.
+        let tx = rusqlite::Transaction::new_unchecked(
+            &conn,
+            rusqlite::TransactionBehavior::Immediate,
+        )
+        .unwrap();
+        let refused = tx.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);");
+        assert!(
+            refused.is_err(),
+            "a checkpoint inside a transaction must fail; if SQLite ever allows it, the \
+             comments on checkpoint_wal and maybe_vacuum are wrong and should be corrected"
+        );
+        drop(tx);
+
+        // OUTSIDE one: it truncates.
+        conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);").unwrap();
+        assert!(
+            size() < grown,
+            "checkpoint outside a transaction must shrink the WAL: {} -> {}",
+            grown,
+            size()
+        );
+    }
+
+    /// The test above proves SQLITE's rule. It does NOT prove this module obeys
+    /// it: both functions could be moved back under `write_async` and it would
+    /// still pass, because it never touches our call sites. That gap is the
+    /// whole defect (a checkpoint that silently never ran), so pin the callers
+    /// too.
+    ///
+    /// Comment lines are excluded deliberately: the fix's own comments say the
+    /// words "write_async" while explaining why not to use it, and a naive grep
+    /// would fail on the corrected code.
+    #[test]
+    fn the_maintenance_paths_call_read_async_not_write_async() {
+        let src = include_str!("storage.rs");
+        for func in ["async fn checkpoint_wal", "async fn maybe_vacuum"] {
+            let start = src.find(func).unwrap_or_else(|| panic!("{func} not found"));
+            let body = &src[start..];
+            let end = body.find("\n}\n").map(|i| i + 2).unwrap_or(body.len());
+            let code: String = body[..end]
+                .lines()
+                .filter(|l| !l.trim_start().starts_with("//"))
+                .collect::<Vec<_>>()
+                .join("\n");
+            assert!(
+                !code.contains(".write_async("),
+                "{func} must not run its pragma through write_async: that wraps the closure in \
+                 an Immediate transaction (db/mod.rs) and SQLite refuses a checkpoint or a \
+                 VACUUM inside one. The failure is silent unless someone reads the WARN."
+            );
+            assert!(
+                code.contains(".read_async("),
+                "{func} should take a pooled, non-transactional connection via read_async"
+            );
+        }
     }
 }
