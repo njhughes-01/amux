@@ -495,11 +495,21 @@ if [[ "$OS" == "Linux" ]] && command -v systemctl &>/dev/null; then
   echo "  ${DIM}systemctl --user enable amux-worker-start${RESET}"
   echo "  ${DIM}systemctl --user start amux-server${RESET}"
   echo ""
-  say "Playwright MCP lanes (edit ports/lanes to match your fleet):"
-  echo "  ${DIM}systemctl --user enable --now amux-xvfb${RESET}"
-  echo "  ${DIM}for i in frontstage-8931 synthesia-8932 backstage-8933 amux-8934 infra-8935; do${RESET}"
-  echo "  ${DIM}  systemctl --user enable --now amux-playwright-mcp@\$i.service${RESET}"
-  echo "  ${DIM}done${RESET}"
+  say "Optional Playwright MCP lanes (localhost-only; enable only lanes that use browser automation):"
+  shopt -s nullglob
+  mcp_lane_files=("$AMUX_HOME/sessions"/*.env)
+  shopt -u nullglob
+  if [ "${#mcp_lane_files[@]}" -eq 0 ]; then
+    say "No registered lanes yet; after registering browser-automation lanes, re-run this installer to print their optional MCP enable commands."
+  else
+    echo "  ${DIM}systemctl --user enable --now amux-xvfb${RESET}"
+    mcp_port=8931
+    for mcp_lane_file in "${mcp_lane_files[@]}"; do
+      mcp_lane=$(basename "$mcp_lane_file" .env)
+      echo "  ${DIM}systemctl --user enable --now amux-playwright-mcp@${mcp_lane}-${mcp_port}.service${RESET}"
+      mcp_port=$((mcp_port + 1))
+    done
+  fi
   echo ""
   say "View logs: ${DIM}journalctl --user -u amux-server -f${RESET}"
   echo ""
