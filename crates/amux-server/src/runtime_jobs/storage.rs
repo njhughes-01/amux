@@ -1036,6 +1036,66 @@ pub fn rotate_session_logs(logs_dir: &Path) -> (usize, u64) {
 /// compromise: frequent enough that a single day's deletions are reclaimed
 /// before the next day's writes fill the freed pages, infrequent enough that
 /// the ~3 GB rewrite cost is negligible.
+/// Truncate the WAL on EVERY tick, independent of VACUUM (AMUX-4811).
+///
+/// The only `wal_checkpoint(TRUNCATE)` used to live inside `maybe_vacuum`,
+/// which the caller invokes only when `total_deleted > 0` and which then
+/// refuses unless 24h have passed. So on any tick where retention deleted
+/// nothing, the WAL was never truncated at all. The comment at that call site
+/// already said "the WAL checkpoint is cheap, full VACUUM is not"; this splits
+/// them so the cheap half runs on the cheap schedule.
+///
+/// It matters because the default 1000-page autocheckpoint runs in PASSIVE
+/// mode: it gives up immediately when any reader is active and does not shrink
+/// the file even when it succeeds. With ~42 lanes polling the API there is
+/// nearly always a reader, so passive checkpoints rarely complete. Measured on
+/// this box 2026-09-18: a 4.16 GB database carrying a 150,025,712 B WAL, grown
+/// in the 16.5 hours since the last VACUUM, about 9 MB/hour that autocheckpoint
+/// never reclaimed.
+///
+/// Returns (before, after) so the caller can publish both. A checkpoint that
+/// ran and freed nothing is a different fact from one that never ran, and only
+/// reporting both tells them apart (ethos rule 4).
+async fn checkpoint_wal(store: &crate::db::SharedStore, home: &Path) -> (Option<u64>, Option<u64>) {
+    let wal = home.join("amux.db-wal");
+    let size = |p: &Path| std::fs::metadata(p).ok().map(|m| m.len());
+    let before = size(&wal);
+    let t0 = std::time::Instant::now();
+    let res = store
+        .write_async(move |conn| {
+            conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")?;
+            Ok(crate::db::WriteOutcome { applied: false, events: vec![] })
+        })
+        .await;
+    let after = size(&wal);
+    match res {
+        Ok(_) => {
+            // Two-fix rule: when this regresses, the log says so without
+            // anyone comparing sizes by hand. A TRUNCATE that leaves the file
+            // large means a reader held the checkpoint off, which is the
+            // failure mode worth seeing.
+            if let (Some(b), Some(a)) = (before, after) {
+                if a > 8 * 1024 * 1024 && a > b / 2 {
+                    tracing::warn!(
+                        before_bytes = b, after_bytes = a,
+                        took_ms = t0.elapsed().as_millis() as u64,
+                        "storage sweep: wal_checkpoint(TRUNCATE) did not shrink the WAL — a \
+                         long-lived reader is holding the checkpoint off (AMUX-4811)"
+                    );
+                } else {
+                    tracing::info!(
+                        before_bytes = b, after_bytes = a,
+                        took_ms = t0.elapsed().as_millis() as u64,
+                        "storage sweep: WAL checkpointed"
+                    );
+                }
+            }
+        }
+        Err(e) => tracing::warn!(error = %e, "storage sweep: wal_checkpoint(TRUNCATE) failed"),
+    }
+    (before, after)
+}
+
 async fn maybe_vacuum(store: &crate::db::SharedStore, home: &Path) -> bool {
     let marker = home.join(".last-vacuum");
     let min_interval = env_u64("AMUX_VACUUM_INTERVAL_SECS", 86_400);
@@ -1114,6 +1174,11 @@ pub struct StorageReport {
     pub dirs_removed: usize,
     pub dir_bytes_freed: u64,
     pub vacuumed: bool,
+    /// WAL size either side of this tick's checkpoint (AMUX-4811). Both are
+    /// reported so "the WAL is small" and "the checkpoint did not run" are
+    /// different readings, which is the distinction that hid this for a month.
+    pub wal_before_bytes: Option<u64>,
+    pub wal_after_bytes: Option<u64>,
     pub rotated_logs_removed: usize,
     pub rotated_logs_freed: u64,
     pub free_bytes: Option<u64>,
@@ -1253,9 +1318,18 @@ pub async fn storage_tick(state: &AppState, home: &Path) -> StorageReport {
     rep.dirs_removed = dirs;
     rep.dir_bytes_freed = dir_bytes;
 
+    // The cheap half, every tick and unconditionally (AMUX-4811). This used to
+    // be reachable only through maybe_vacuum below, so a tick that deleted
+    // nothing never truncated the WAL and it grew until some later tick both
+    // deleted something AND cleared the 24h vacuum interval.
+    let (wal_before, wal_after) = checkpoint_wal(&state.store, home).await;
+    rep.wal_before_bytes = wal_before;
+    rep.wal_after_bytes = wal_after;
+
     // VACUUM reclaims disk space that DELETE freed inside SQLite but did not
     // return to the OS. Only run when something was actually deleted, and at
-    // most once per day (the WAL checkpoint is cheap, full VACUUM is not).
+    // most once per day. Full VACUUM is expensive and stays gated; the WAL
+    // checkpoint it used to carry now runs above on its own schedule.
     let total_deleted: usize = rep.tables.iter()
         .filter(|(_, v)| v.contains("Deleted { rows:") && !v.contains("rows: 0"))
         .count();
