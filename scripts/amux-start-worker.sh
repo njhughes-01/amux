@@ -18,7 +18,7 @@
 # Derived, never a hardcoded user: a copy of this script on a host whose user
 # was not `syseng` pointed at that user's nonexistent home, so the lane glob was
 # empty and boot recovery exited 1 without being able to write this log.
-AMUX_HOME="${AMUX_HOME:-$HOME/.amux}"
+AMUX_HOME="${AMUX_HOME:-${CC_HOME:-$HOME/.amux}}"
 LOG_FILE="$AMUX_HOME/worker-start.log"
 SESSIONS_DIR="$AMUX_HOME/sessions"
 
@@ -26,8 +26,8 @@ SESSIONS_DIR="$AMUX_HOME/sessions"
 # lane amux knows about" (AMUX-49) — a lane is never silently dropped because
 # nobody listed it — with two narrow exceptions:
 #   - SKIP_LANES: on-demand lanes, space-separated (AMUX_BOOT_SKIP_LANES)
-#   - archived lanes (CC_ARCHIVED=1): start_session refuses them ("wake it
-#     first"), so trying would only count a deliberate park as a failure.
+#   - archived or paused lanes: start_session refuses them, so trying would
+#     only count a deliberate park as a failure.
 SKIP_LANES="${AMUX_BOOT_SKIP_LANES-}"
 
 echo "$(date): Starting worker startup script" >> "$LOG_FILE"
@@ -112,33 +112,38 @@ skipped_names=()
 for f in "${lane_files[@]}"; do
     name=$(basename "$f" .env)
     # Deliberate skips are neither starts nor failures.
-    if [[ " $SKIP_LANES " == *" $name "* ]] || grep -qx 'CC_ARCHIVED=1' "$f"; then
-        echo "$(date): [$name] SKIPPED — on-demand or archived; start it by hand with: amux start $name" >> "$LOG_FILE"
-        skipped=$((skipped + 1))
-        skipped_names+=("$name")
-        continue
-    fi
-    echo "$(date): Calling amux API to start worker: $name..." >> "$LOG_FILE"
-    RESPONSE=$(/usr/bin/curl -sk --connect-timeout 5 --max-time 10 -X POST "https://localhost:8824/api/sessions/$name/start" \
-      -H "Content-Type: application/json" \
-      -d '{"backend": "tmux"}' 2>&1)
-    CURL_RC=$?
-    echo "$(date): [$name] curl exit=$CURL_RC response=$RESPONSE" >> "$LOG_FILE"
+    if grep -q '^CC_ARCHIVED="\?1' "$f"; then
+        echo "$(date): [$name] SKIPPED — archived; wake it by hand with: amux wake $name" >> "$LOG_FILE"
+    elif grep -q '^CC_PAUSED="\?1' "$f"; then
+        echo "$(date): [$name] SKIPPED — paused; resume it by hand before starting" >> "$LOG_FILE"
+    elif [[ " $SKIP_LANES " == *" $name "* ]]; then
+        echo "$(date): [$name] SKIPPED — on-demand; start it by hand with: amux start $name" >> "$LOG_FILE"
+    else
+        echo "$(date): Calling amux API to start worker: $name..." >> "$LOG_FILE"
+        RESPONSE=$(/usr/bin/curl -sk --connect-timeout 5 --max-time 10 -X POST "https://localhost:8824/api/sessions/$name/start" \
+          -H "Content-Type: application/json" \
+          -d '{"backend": "tmux"}' 2>&1)
+        CURL_RC=$?
+        echo "$(date): [$name] curl exit=$CURL_RC response=$RESPONSE" >> "$LOG_FILE"
 
-    if [ $CURL_RC -eq 0 ] && echo "$RESPONSE" | grep -q '"ok":true'; then
-        if verify_running "$name"; then
-            echo "$(date): [$name] worker startup successful (verified running)" >> "$LOG_FILE"
-            started=$((started + 1))
+        if [ $CURL_RC -eq 0 ] && echo "$RESPONSE" | grep -q '"ok":true'; then
+            if verify_running "$name"; then
+                echo "$(date): [$name] worker startup successful (verified running)" >> "$LOG_FILE"
+                started=$((started + 1))
+            else
+                echo "$(date): [$name] WARN worker startup ACCEPTED but pane never came up running (checked for ~10s) — likely a dead shell (bad PATH, missing binary, .bashrc error); treating as failed" >> "$LOG_FILE"
+                failed=$((failed + 1))
+                failed_names+=("$name")
+            fi
         else
-            echo "$(date): [$name] WARN worker startup ACCEPTED but pane never came up running (checked for ~10s) — likely a dead shell (bad PATH, missing binary, .bashrc error); treating as failed" >> "$LOG_FILE"
+            echo "$(date): [$name] worker startup FAILED" >> "$LOG_FILE"
             failed=$((failed + 1))
             failed_names+=("$name")
         fi
-    else
-        echo "$(date): [$name] worker startup FAILED" >> "$LOG_FILE"
-        failed=$((failed + 1))
-        failed_names+=("$name")
+        continue
     fi
+        skipped=$((skipped + 1))
+        skipped_names+=("$name")
 done
 
 echo "$(date): worker startup summary: $started started, $failed failed (${failed_names[*]:-none}), $skipped skipped (${skipped_names[*]:-none})" >> "$LOG_FILE"
