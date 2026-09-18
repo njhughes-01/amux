@@ -29210,7 +29210,7 @@ function _focusDone() {
     + '<button class="btn primary" style="margin-top:20px;" onclick="_focusClose()">Done</button></div>';
 }
 function _focusKey(e) {
-  if (e.ctrlKey || e.metaKey || e.altKey || e.isComposing) return;
+  if (e.ctrlKey || e.metaKey || e.altKey || e.isComposing || e.keyCode === 229) return;
   const target = e.target;
   const typing = target && (target.closest?.('input, textarea, select') || target.isContentEditable);
   if (e.key === 'Escape') {
@@ -29218,7 +29218,9 @@ function _focusKey(e) {
     if (target === answer && answer.value) {
       e.preventDefault(); e.stopImmediatePropagation(); answer.blur(); return;
     }
-    e.preventDefault(); _focusClose(); return;
+    e.preventDefault();
+    if (answer && document.getElementById('modal-backdrop')?.classList.contains('open')) _modalClose(false);
+    _focusClose(); return;
   }
   if (typing) return;
   if (e.key === 'j' || e.key === 'ArrowRight') { e.preventDefault(); _focusNext(); }

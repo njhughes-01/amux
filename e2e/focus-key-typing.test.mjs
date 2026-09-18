@@ -17,8 +17,10 @@ function focusKeys() {
     blur: () => actions.push('blur'),
   };
   const outside = { isContentEditable: false, closest: () => null };
+  const modal = { open: true, classList: { contains: name => name === 'open' && modal.open } };
   const context = {
-    document: { getElementById: id => id === 'focus-ans' ? answer : null },
+    document: { getElementById: id => id === 'focus-ans' ? answer : id === 'modal-backdrop' ? modal : null },
+    _modalClose: value => { actions.push(['modal-close', value]); modal.open = false; },
     _focusClose: () => actions.push('close'),
     _focusNext: () => actions.push('next'),
     _focusPrev: () => actions.push('prev'),
@@ -38,7 +40,7 @@ function focusKeys() {
     context.key(event);
     return event;
   };
-  return { actions, answer, outside, press };
+  return { actions, answer, modal, outside, press };
 }
 
 test('focus shortcuts ignore Answer typing and preserve outside approve and nudge', () => {
@@ -53,8 +55,8 @@ test('focus shortcuts ignore Answer typing and preserve outside approve and nudg
   assert.deepEqual(actions, ['approved', 'nudge']);
 });
 
-test('focus Escape blurs nonempty Answer first and ignores modified or composing keys', () => {
-  const { actions, answer, outside, press } = focusKeys();
+test('focus Escape blurs nonempty Answer first, then closes its modal and overlay', () => {
+  const { actions, answer, modal, outside, press } = focusKeys();
   answer.value = 'approve now';
   const first = press('Escape', answer);
   assert.equal(first.defaultPrevented, true);
@@ -62,8 +64,16 @@ test('focus Escape blurs nonempty Answer first and ignores modified or composing
   assert.deepEqual(actions, ['blur']);
   press('a', outside, { ctrlKey: true });
   press('n', outside, { isComposing: true });
+  press('a', outside, { keyCode: 229 });
   assert.deepEqual(actions, ['blur']);
-  answer.value = '';
+  press('Escape', outside);
+  assert.deepEqual(actions, ['blur', ['modal-close', false], 'close']);
+  assert.equal(modal.open, false);
+});
+
+test('Escape on empty Answer closes its modal before the focus overlay', () => {
+  const { actions, answer, modal, press } = focusKeys();
   press('Escape', answer);
-  assert.deepEqual(actions, ['blur', 'close']);
+  assert.deepEqual(actions, [['modal-close', false], 'close']);
+  assert.equal(modal.open, false);
 });
