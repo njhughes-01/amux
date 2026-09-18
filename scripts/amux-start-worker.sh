@@ -15,8 +15,20 @@
 # failure bug in the CLI. This script doesn't depend on that CLI's own
 # internal error handling; it drives the HTTP API directly per lane so a
 # single failure can never truncate the loop.
-LOG_FILE="/home/syseng/.amux/worker-start.log"
-SESSIONS_DIR="/home/syseng/.amux/sessions"
+# Derived, never a hardcoded user: a copy of this script on a host whose user
+# was not `syseng` pointed at that user's nonexistent home, so the lane glob was
+# empty and boot recovery exited 1 without being able to write this log.
+AMUX_HOME="${AMUX_HOME:-$HOME/.amux}"
+LOG_FILE="$AMUX_HOME/worker-start.log"
+SESSIONS_DIR="$AMUX_HOME/sessions"
+
+# Lanes deliberately NOT auto-started at boot. The default stays "start every
+# lane amux knows about" (AMUX-49) — a lane is never silently dropped because
+# nobody listed it — with two narrow exceptions:
+#   - SKIP_LANES: on-demand lanes, space-separated (AMUX_BOOT_SKIP_LANES)
+#   - archived lanes (CC_ARCHIVED=1): start_session refuses them ("wake it
+#     first"), so trying would only count a deliberate park as a failure.
+SKIP_LANES="${AMUX_BOOT_SKIP_LANES-}"
 
 echo "$(date): Starting worker startup script" >> "$LOG_FILE"
 
@@ -94,8 +106,18 @@ verify_running() {
     return 1
 }
 
+skipped=0
+skipped_names=()
+
 for f in "${lane_files[@]}"; do
     name=$(basename "$f" .env)
+    # Deliberate skips are neither starts nor failures.
+    if [[ " $SKIP_LANES " == *" $name "* ]] || grep -qx 'CC_ARCHIVED=1' "$f"; then
+        echo "$(date): [$name] SKIPPED — on-demand or archived; start it by hand with: amux start $name" >> "$LOG_FILE"
+        skipped=$((skipped + 1))
+        skipped_names+=("$name")
+        continue
+    fi
     echo "$(date): Calling amux API to start worker: $name..." >> "$LOG_FILE"
     RESPONSE=$(/usr/bin/curl -sk --connect-timeout 5 --max-time 10 -X POST "https://localhost:8824/api/sessions/$name/start" \
       -H "Content-Type: application/json" \
@@ -119,15 +141,16 @@ for f in "${lane_files[@]}"; do
     fi
 done
 
-echo "$(date): worker startup summary: $started started, $failed failed (${failed_names[*]:-none})" >> "$LOG_FILE"
+echo "$(date): worker startup summary: $started started, $failed failed (${failed_names[*]:-none}), $skipped skipped (${skipped_names[*]:-none})" >> "$LOG_FILE"
 
 # Partial success is still success for this unit: a lane with its own
 # pre-existing, unrelated problem (the historical shape) must not read as
 # "the whole boot-recovery mechanism is broken" the way a hard exit 1 would
 # under systemd's oneshot status. Only a total loss (every lane failed, or
-# the loop never ran) is a real failure of THIS script's own job.
-if [ $started -eq 0 ]; then
-    echo "$(date): ERROR: every lane failed to start" >> "$LOG_FILE"
+# the loop never ran) is a real failure of THIS script's own job — judged on
+# the lanes actually ATTEMPTED, so all-skipped is not a failure.
+if [ $started -eq 0 ] && [ $failed -gt 0 ]; then
+    echo "$(date): ERROR: every lane that was attempted failed to start" >> "$LOG_FILE"
     exit 1
 fi
 exit 0
