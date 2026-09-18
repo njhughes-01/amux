@@ -2701,37 +2701,45 @@ pub(crate) fn session_jsonl_path(name: &str) -> Option<PathBuf> {
 /// wander, and `session_jsonl_path`'s "newest mtime wins" discipline is applied
 /// the same way here.
 fn codex_rollout_files() -> Vec<(std::time::SystemTime, PathBuf)> {
+    codex_rollout_files_checked().unwrap_or_default()
+}
+
+fn codex_rollout_files_checked() -> std::io::Result<Vec<(std::time::SystemTime, PathBuf)>> {
     // Codex writes to the OS home (`~/.codex`), NOT amux's `home()` (`~/.amux`);
     // the two differ and the first cut pointed at `~/.amux/.codex`, so every
     // resolution missed, which the debug trace in `codex_transcript_events`
     // surfaced immediately (ethos rule 4). Same `$HOME`-based path shape as
     // `claude_home()`.
     let root = PathBuf::from(std::env::var("HOME").unwrap_or_default()).join(".codex/sessions");
+    codex_rollout_files_from(&root)
+}
+
+fn codex_rollout_files_from(root: &Path) -> std::io::Result<Vec<(std::time::SystemTime, PathBuf)>> {
     let mut out: Vec<(std::time::SystemTime, PathBuf)> = Vec::new();
-    fn walk(dir: &Path, depth: usize, out: &mut Vec<(std::time::SystemTime, PathBuf)>) {
+    fn walk(dir: &Path, depth: usize, out: &mut Vec<(std::time::SystemTime, PathBuf)>) -> std::io::Result<()> {
         if depth > 3 {
-            return;
+            return Ok(());
         }
-        let Ok(rd) = std::fs::read_dir(dir) else { return };
-        for e in rd.flatten() {
+        for e in std::fs::read_dir(dir)? {
+            let e = e?;
             let p = e.path();
-            if p.is_dir() {
-                walk(&p, depth + 1, out);
+            let metadata = e.metadata()?;
+            if metadata.is_dir() {
+                walk(&p, depth + 1, out)?;
             } else if p
                 .file_name()
                 .and_then(|s| s.to_str())
                 .map(|s| s.starts_with("rollout-") && s.ends_with(".jsonl"))
                 .unwrap_or(false)
             {
-                if let Some(t) = p.metadata().ok().and_then(|m| m.modified().ok()) {
-                    out.push((t, p));
-                }
+                out.push((metadata.modified()?, p));
             }
         }
+        Ok(())
     }
-    walk(&root, 0, &mut out);
+    walk(root, 0, &mut out)?;
     out.sort_by_key(|e| std::cmp::Reverse(e.0));
-    out
+    Ok(out)
 }
 
 /// A pinned Codex id is resumable only while its rollout exists on disk.
@@ -2740,12 +2748,15 @@ fn codex_launch_command(
     base_bin: &str,
     opts: &str,
     meta: &mut Map<String, Value>,
-    files: &[(std::time::SystemTime, PathBuf)],
+    files: Option<&[(std::time::SystemTime, PathBuf)]>,
 ) -> (String, bool) {
     let id = meta_str(meta, "codex_session_id");
     if id.is_empty() {
         return (format!("{base_bin}{opts}"), false);
     }
+    let Some(files) = files else {
+        return (format!("{base_bin} resume{opts} {id}"), false);
+    };
     let exists = files.iter().any(|(_, path)| {
         path.file_name().and_then(|name| name.to_str()).is_some_and(|name| name.contains(&id))
     });
@@ -9138,8 +9149,17 @@ pub(crate) async fn start_session(state: &AppState, name: &str, extra_flags: &st
                 format!("{base_bin}{opts}")
             } else {
                 let codex_session_id = meta_str(&meta, "codex_session_id");
-                let files = if codex_session_id.is_empty() { Vec::new() } else { codex_rollout_files() };
-                let (cmd, changed) = codex_launch_command(base_bin, &opts, &mut meta, &files);
+                let files = if codex_session_id.is_empty() { None } else {
+                    match codex_rollout_files_checked() {
+                        Ok(files) => Some(files),
+                        Err(error) => {
+                            tracing::warn!(session = name, codex_session_id = %codex_session_id, %error,
+                                "could not verify claimed Codex rollout; preserving resume identity");
+                            None
+                        }
+                    }
+                };
+                let (cmd, changed) = codex_launch_command(base_bin, &opts, &mut meta, files.as_deref());
                 if changed {
                     tracing::warn!(session = name, codex_session_id = %codex_session_id,
                         "claimed codex session missing on disk; starting a fresh conversation");
@@ -26941,7 +26961,7 @@ CLAUDE-POSTFIX-COMPLETE
     #[test]
     fn codex_missing_rollout_starts_fresh_and_clears_claim() {
         let mut meta = json!({"codex_session_id":"dead-id", "cc_task":"keep"}).as_object().unwrap().clone();
-        let (cmd, changed) = codex_launch_command("codex", " --model gpt-5.5", &mut meta, &[]);
+        let (cmd, changed) = codex_launch_command("codex", " --model gpt-5.5", &mut meta, Some(&[]));
         assert_eq!(cmd, "codex --model gpt-5.5");
         assert!(changed);
         assert!(!meta.contains_key("codex_session_id"));
@@ -26955,10 +26975,27 @@ CLAUDE-POSTFIX-COMPLETE
         let rollout = dir.path().join("rollout-2026-09-18-live-id.jsonl");
         std::fs::write(&rollout, "").unwrap();
         let files = vec![(std::time::SystemTime::now(), rollout)];
-        let (cmd, changed) = codex_launch_command("codex", " --model gpt-5.5", &mut meta, &files);
+        let (cmd, changed) = codex_launch_command("codex", " --model gpt-5.5", &mut meta, Some(&files));
         assert_eq!(cmd, "codex resume --model gpt-5.5 live-id");
         assert!(!changed);
         assert_eq!(meta["codex_session_id"], "live-id");
+    }
+
+    #[test]
+    fn codex_rollout_scan_failure_preserves_resume_claim() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(codex_rollout_files_from(&dir.path().join("unreadable-sessions")).is_err());
+        let mut meta = json!({"codex_session_id":"pinned-id"}).as_object().unwrap().clone();
+        let (cmd, changed) = codex_launch_command("codex", " --model gpt-5.5", &mut meta, None);
+        assert_eq!(cmd, "codex resume --model gpt-5.5 pinned-id");
+        assert!(!changed);
+        assert_eq!(meta["codex_session_id"], "pinned-id");
+
+        let files = codex_rollout_files_from(dir.path()).unwrap();
+        let (cmd, changed) = codex_launch_command("codex", " --model gpt-5.5", &mut meta, Some(&files));
+        assert_eq!(cmd, "codex --model gpt-5.5");
+        assert!(changed);
+        assert!(!meta.contains_key("codex_session_id"));
     }
 
     #[test]
