@@ -2730,6 +2730,29 @@ fn codex_rollout_files() -> Vec<(std::time::SystemTime, PathBuf)> {
     out
 }
 
+/// A pinned Codex id is resumable only while its rollout exists on disk.
+/// Return whether the metadata changed so the caller can persist a dead claim.
+fn codex_launch_command(
+    base_bin: &str,
+    opts: &str,
+    meta: &mut Map<String, Value>,
+    files: &[(std::time::SystemTime, PathBuf)],
+) -> (String, bool) {
+    let id = meta_str(meta, "codex_session_id");
+    if id.is_empty() {
+        return (format!("{base_bin}{opts}"), false);
+    }
+    let exists = files.iter().any(|(_, path)| {
+        path.file_name().and_then(|name| name.to_str()).is_some_and(|name| name.contains(&id))
+    });
+    if exists {
+        (format!("{base_bin} resume{opts} {id}"), false)
+    } else {
+        meta.remove("codex_session_id");
+        (format!("{base_bin}{opts}"), true)
+    }
+}
+
 /// Identity carried by a rollout's first `session_meta` row.
 ///
 /// `cwd` alone is not an identity: several workers routinely share one
@@ -9069,7 +9092,6 @@ pub(crate) async fn start_session(state: &AppState, name: &str, extra_flags: &st
         "codex" => {
             // py:24380 — codex command construction (trust-db side effect not
             // ported).
-            let codex_session_id = if skip_conv_id { String::new() } else { meta_str(&meta, "codex_session_id") };
             let mut codex_flags = flags.clone();
             let codex_yolo = PROVIDER_YOLO_FLAGS.iter().any(|f| codex_flags.contains(f));
             if codex_yolo {
@@ -9107,10 +9129,18 @@ pub(crate) async fn start_session(state: &AppState, name: &str, extra_flags: &st
                     }
                 }
             }
-            if !codex_session_id.is_empty() {
-                format!("{base_bin} resume{opts} {codex_session_id}")
-            } else {
+            if skip_conv_id {
                 format!("{base_bin}{opts}")
+            } else {
+                let codex_session_id = meta_str(&meta, "codex_session_id");
+                let files = if codex_session_id.is_empty() { Vec::new() } else { codex_rollout_files() };
+                let (cmd, changed) = codex_launch_command(base_bin, &opts, &mut meta, &files);
+                if changed {
+                    tracing::warn!(session = name, codex_session_id = %codex_session_id,
+                        "claimed codex session missing on disk; starting a fresh conversation");
+                    save_meta(name, &meta);
+                }
+                cmd
             }
         }
         "gemini" => {
@@ -26886,6 +26916,29 @@ CLAUDE-POSTFIX-COMPLETE
         let mut second = Map::new();
         gemini_session_flag(&mut second, false);
         assert_ne!(&id[..8], &meta_str(&second, "gemini_session_id")[..8], "peers must not share a time-derived filename prefix");
+    }
+
+    #[test]
+    fn codex_missing_rollout_starts_fresh_and_clears_claim() {
+        let mut meta = json!({"codex_session_id":"dead-id", "cc_task":"keep"}).as_object().unwrap().clone();
+        let (cmd, changed) = codex_launch_command("codex", " --model gpt-5.5", &mut meta, &[]);
+        assert_eq!(cmd, "codex --model gpt-5.5");
+        assert!(changed);
+        assert!(!meta.contains_key("codex_session_id"));
+        assert_eq!(meta["cc_task"], "keep");
+    }
+
+    #[test]
+    fn codex_existing_rollout_keeps_resume_claim() {
+        let mut meta = json!({"codex_session_id":"live-id"}).as_object().unwrap().clone();
+        let dir = tempfile::tempdir().unwrap();
+        let rollout = dir.path().join("rollout-2026-09-18-live-id.jsonl");
+        std::fs::write(&rollout, "").unwrap();
+        let files = vec![(std::time::SystemTime::now(), rollout)];
+        let (cmd, changed) = codex_launch_command("codex", " --model gpt-5.5", &mut meta, &files);
+        assert_eq!(cmd, "codex resume --model gpt-5.5 live-id");
+        assert!(!changed);
+        assert_eq!(meta["codex_session_id"], "live-id");
     }
 
     #[tokio::test]
