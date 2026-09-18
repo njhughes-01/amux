@@ -655,6 +655,10 @@ fn update_meta(name: &str, updates: &[(&str, Value)]) {
     save_meta(name, &meta);
 }
 
+// Serialize Codex rollout adoption with start_session's final metadata write.
+// Both paths otherwise load and replace the entire metadata file.
+static CODEX_ID_META_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 fn meta_str(meta: &Map<String, Value>, key: &str) -> String {
     meta.get(key).and_then(|v| v.as_str()).unwrap_or("").to_string()
 }
@@ -2883,6 +2887,7 @@ pub(crate) fn codex_rollout_path(name: &str) -> Option<PathBuf> {
             .as_ref()
             .and_then(|path| rollout_session_id(path).map(|id| (path, id)))
         {
+            let _guard = CODEX_ID_META_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
             update_meta(name, &[("codex_session_id", json!(rollout_id))]);
             tracing::warn!(
                 target: "status_truth",
@@ -9803,7 +9808,7 @@ pub(crate) async fn start_session(state: &AppState, name: &str, extra_flags: &st
         meta.insert("pending_structured_resume_context".into(), json!(context));
         meta.insert("pending_structured_resume_token".into(), token.clone());
     }
-    if let Err(error) = save_resume_meta(name, &meta) {
+    if let Err(error) = save_start_meta(name, &mut meta, &provider) {
         tracing::warn!(session = name, %error, verdict = "swap_context_persist_failed",
             "started worker retains recovery requirement; metadata commit failed");
         return (false, "started, but durable resume context is unresolved".into());
@@ -10906,6 +10911,21 @@ fn save_resume_meta(name: &str, meta: &Map<String, Value>) -> std::io::Result<()
     })();
     if result.is_err() { let _ = std::fs::remove_file(temp); }
     result
+}
+
+fn save_start_meta(name: &str, meta: &mut Map<String, Value>, provider: &str) -> std::io::Result<()> {
+    if provider != "codex" {
+        return save_resume_meta(name, meta);
+    }
+    let _guard = CODEX_ID_META_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    // A status poll may have adopted the new rollout while startup waited for
+    // the UI. Preserve that durable claim instead of restoring this function's
+    // older snapshot, which intentionally had the dead id removed.
+    match load_meta(name).get("codex_session_id").cloned() {
+        Some(id) => { meta.insert("codex_session_id".into(), id); }
+        None => { meta.remove("codex_session_id"); }
+    }
+    save_resume_meta(name, meta)
 }
 
 fn write_swap_config(
@@ -26939,6 +26959,23 @@ CLAUDE-POSTFIX-COMPLETE
         assert_eq!(cmd, "codex resume --model gpt-5.5 live-id");
         assert!(!changed);
         assert_eq!(meta["codex_session_id"], "live-id");
+    }
+
+    #[test]
+    fn codex_start_preserves_rollout_adopted_during_launch() {
+        let dir = tempfile::tempdir().unwrap();
+        let _home = crate::api::settings::test_env::set_home(dir.path());
+        let name = "codex-adopted-during-launch";
+        let mut start_snapshot = json!({"last_started":1}).as_object().unwrap().clone();
+        save_meta(name, &start_snapshot);
+        // The status poller adopts the newly-created rollout before startup's
+        // final metadata write. That write must retain the adopted identity.
+        update_meta(name, &[("codex_session_id", json!("new-rollout-id"))]);
+        start_snapshot.insert("start_count".into(), json!(1));
+        save_start_meta(name, &mut start_snapshot, "codex").unwrap();
+        let saved = load_meta(name);
+        assert_eq!(saved["codex_session_id"], "new-rollout-id");
+        assert_eq!(saved["start_count"], 1);
     }
 
     #[tokio::test]
