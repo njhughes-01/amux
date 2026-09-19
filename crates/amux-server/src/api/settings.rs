@@ -83,6 +83,36 @@ pub(crate) fn effective_env(home: &Path, key: &str) -> Option<String> {
     std::env::var(key).ok().filter(|v| !v.is_empty())
 }
 
+/// The name of the person who owns this amux install, as shown on cards and in
+/// messages to lanes. `AMUX_OWNER_NAME` in server.env first (read at use, so a
+/// PATCH takes effect without a restart), then the global git `user.name`, then
+/// the login name. Never a baked-in person: a fork run by someone else used to
+/// record every dashboard decision as the upstream author's, and lanes rightly
+/// refused those as approvals from a stranger.
+pub(crate) fn owner_name(home: &Path) -> String {
+    let clean = |v: String| {
+        let v = v.trim().to_string();
+        (!v.is_empty()).then_some(v)
+    };
+    if let Some(v) = effective_env(home, "AMUX_OWNER_NAME").and_then(clean) {
+        return v;
+    }
+    let git = std::process::Command::new("git")
+        .args(["config", "--global", "--get", "user.name"])
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .and_then(clean);
+    if let Some(v) = git {
+        return v;
+    }
+    ["USER", "LOGNAME"]
+        .iter()
+        .find_map(|k| std::env::var(k).ok().and_then(clean))
+        .unwrap_or_else(|| "owner".to_string())
+}
+
 /// Python's server.env line-replace: rewrite the first `KEY=`/`KEY =` line,
 /// else append. Non-atomic plain write, matching Python (`_env_set`).
 /// `pub(crate)`: shared with the alert-config PATCH (api/alerts.rs), which
@@ -927,6 +957,23 @@ pub(crate) mod test_env {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The owner shown on cards comes from AMUX_OWNER_NAME and is re-read at
+    /// use; with it unset the answer is still a real local identity, never the
+    /// upstream author's name.
+    #[test]
+    fn owner_name_reads_the_configured_owner_and_never_a_baked_in_person() {
+        let _lock = test_env::LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().expect("tmp");
+        set_server_env_key(dir.path(), "AMUX_OWNER_NAME", "  Nathan ").unwrap();
+        assert_eq!(owner_name(dir.path()), "Nathan");
+        set_server_env_key(dir.path(), "AMUX_OWNER_NAME", "Someone Else").unwrap();
+        assert_eq!(owner_name(dir.path()), "Someone Else", "must re-read server.env at use");
+        set_server_env_key(dir.path(), "AMUX_OWNER_NAME", "").unwrap();
+        let fallback = owner_name(dir.path());
+        assert!(!fallback.trim().is_empty(), "fallback must name someone");
+        assert_ne!(fallback, "Ethan", "fallback must come from this machine, not upstream");
+    }
 
 
     /// AMUX-2904. Clearing an API key must actually clear it. `effective_env`
