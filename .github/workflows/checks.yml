@@ -338,6 +338,10 @@ jobs:
         run: |
           set -uo pipefail
           bash scripts/test-cli-quoting.sh
+      - name: board reviewer/shepherd refuse an unreachable session
+        run: |
+          set -uo pipefail
+          bash scripts/test-cli-reviewer-shepherd-guard.sh
       - name: the commit-intent manifest round-trips
         run: |
           set -uo pipefail
