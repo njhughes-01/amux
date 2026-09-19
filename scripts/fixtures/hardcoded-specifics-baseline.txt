@@ -1,36 +1,16 @@
 # path<TAB>snippet: one row per known hit. Remove rows as they are fixed; never add one.
-amux	Generic placeholders are not routable. Example: --actor Ethan or --actor vendor-support" ;;
-amux	amux board needsyou $id --actor Ethan --ask decision --question \"...?\" --unblocks \"...\""
-amux	this session's live browser view (Ethan clicks to sign in).
-crates/amux-core/src/board.rs	"ethan asked to",
-crates/amux-core/src/board.rs	"hold any new", "hold all", "it is already restored", "ethan asked at",
-crates/amux-dashboard/static/app.js	'What did Ethan ask for that is still not done?',
-crates/amux-dashboard/static/app.js	'blocked:human', 'human-gated', 'awaiting-decision', 'awaiting-ethan']);
-crates/amux-dashboard/static/app.js	await _focusPatch(item.id, { desc_append: '`answered` Ethan: ' + ans });
-crates/amux-dashboard/static/app.js	await _focusPatch(item.id, { desc_append: '`decision` Ethan ' + verdict.toUpperCase() + ' ' + new Date().toISOString().slice(0,10) });
-crates/amux-dashboard/static/app.js	await _focusPatch(item.id, { desc_append: '`nudge` Ethan asked ' + (item.session||'?') + ' to advance this' });
-crates/amux-dashboard/static/app.js	const _NEEDS_HUMAN_TAGS = new Set(['needs:you', 'needs:ethan', 'needs:human',
-crates/amux-dashboard/static/app.js	const ms = [...hay.matchAll(/NEEDS[- ]?(?:YOU|ETHAN|HUMAN):\s*([^\n]+)/ig)];
-crates/amux-dashboard/static/app.js	if (item.session) { try { await _focusSend(item.session, '[Ethan decision on ' + item.id + '] ' + verdict.toUpperCase() + ' — proceed accordingly.'); } catch(e) {} }
-crates/amux-dashboard/static/app.js	if (sess) { try { await _focusSend(sess, '[Ethan, re ' + item.id + '] ' + ans); } catch(e) {} }
-crates/amux-server/src/api/alerts.rs	prompt in. Two things that DO work: set TWILIO_* creds, or have Ethan trigger a send \
+crates/amux-dashboard/static/app.js	const _LEGACY_HUMAN_TAGS = ['needs:ethan', 'awaiting-ethan'];
+crates/amux-dashboard/static/app.js	const ms = [...hay.matchAll(/NEEDS[- ]?(?:YOU|OWNER|HUMAN|ETHAN):\s*([^\n]+)/ig)];
 crates/amux-server/src/api/board.rs	"`ask_question` has to be an actual question, in a sentence. \"Blocked on Ethan\" with no question is not an ask — that phrasing is most of what is sitting in this queue today.",
 crates/amux-server/src/api/board.rs	"`ask_question` has to be an actual question, in a sentence. \"Blocked on Ethan\" with no question is not an ask — that phrasing is most of what is sitting in this queue today.",
 crates/amux-server/src/api/board.rs	"needs-ethan:", "needs ethan:", "needsethan:",
-crates/amux-server/src/api/board.rs	.unwrap_or("Ethan")
-crates/amux-server/src/api/email.rs	"from": if from_acct.is_empty() { "ethan@mixpeek.com".to_string() } else { from_acct.clone() },
 crates/amux-server/src/api/email.rs	"what_to_do": "surface the preview to Ethan (board card or your turn output) and \
 crates/amux-server/src/api/email.rs	"why": "external recipients + worker origin: Ethan's rule (2026-08-22) — no email \
 crates/amux-server/src/api/email.rs	worker origin. Surface the preview to Ethan instead.",
-crates/amux-server/src/api/messages.rs	"[amux accountability] You have {msgs} message(s) from Ethan in the last {since_h}h with \
 crates/amux-server/src/api/reclaim.rs	PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| "/Users/ethan".into()))
-crates/amux-server/src/api/session_verbs.rs	"STOP and surface this to Ethan — do not retry, do not reroute, do not \
-crates/amux-server/src/api/session_verbs.rs	"\n\n[no reply path: `{origin}` is an isolated (raw-agent) worker. A peer send back to it is REFUSED — it is reachable only by its owner from the dashboard. If this message asks you something, answer 
 crates/amux-server/src/api/sessions_legacy.rs	full path (e.g. /Users/you/Projects/thing) and it will be created"
 crates/amux-server/src/db/board_store.rs	"needs-ethan:", "needs ethan:", "needsethan:",
-crates/amux-server/src/integrations/email.rs	["mixpeek.com", "trymixpeek.com", "joinmixpeek.com", "getmixpeek.com"];
 crates/amux-server/src/invariants/monitor.rs	&std::env::var("AMUX_REPO_ROOT").unwrap_or_else(|_| "/Users/ethan/Dev/amux".into()),
-crates/amux-server/src/runtime_jobs/autofix.rs	should be running this many lanes on one subscription, which is Ethan's call \
 crates/amux-server/src/runtime_jobs/mac_health.rs	let home = std::env::var("HOME").unwrap_or_else(|_| "/Users/ethan".into());
 crates/amux-server/src/runtime_jobs/mac_health.rs	let home = std::env::var("HOME").unwrap_or_else(|_| "/Users/ethan".into());
 scripts/fleet-boot.sh	AMUX_BIN="${AMUX_BIN:-/Users/ethan/Dev/amux/amux}"
@@ -53,7 +33,6 @@ scripts/frustrations-archive.py	gone/isolated author under Ethan’s AF-352 deci
 scripts/frustrations_retire.py	and nothing about its name warns you: `retire` is closer to the words Ethan
 scripts/hooks/mail-app-guard.py	"(Ethan, 2026-08-13).\n"
 scripts/hooks/mail-app-guard.py	"Mail.app sends from the machine's DEFAULT (Ethan's personal) account, "
-scripts/hooks/mail-app-guard.py	"\"from\":\"ethan@mixpeek.com\"}' \"$AMUX_URL/api/email/send\"\n"
 scripts/hooks/mail-app-guard.py	- Mail.app sends from the machine's DEFAULT account — Ethan's PERSONAL one —
 scripts/hooks/mail-app-guard.py	Ethan, 2026-08-13: "make sure amux is never using mail.app — it should
 scripts/mac-pressure-tripwire.sh	amux alert "$msg" "$why" >/dev/null 2>&1 && echo "mac-tripwire: PAGED Ethan — $reasons" \
