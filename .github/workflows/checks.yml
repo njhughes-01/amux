@@ -424,6 +424,10 @@ jobs:
         run: |
           set -uo pipefail
           bash scripts/test-shared-guard-attribution.sh
+      - name: no person, machine or deployment is hardcoded (public repo)
+        run: |
+          set -uo pipefail
+          python3 scripts/test-no-hardcoded-specifics.py
       - name: the shipped status hooks survive real durability regressions
         run: |
           set -uo pipefail

@@ -1,0 +1,23 @@
+# path	count	why (lower the count as each is fixed; never raise it)
+amux	3	known upstream-specific runtime value, pending fix
+crates/amux-core/src/board.rs	2	known upstream-specific runtime value, pending fix
+crates/amux-dashboard/static/app.js	9	known upstream-specific runtime value, pending fix
+crates/amux-server/src/api/alerts.rs	1	known upstream-specific runtime value, pending fix
+crates/amux-server/src/api/email.rs	4	known upstream-specific runtime value, pending fix
+crates/amux-server/src/api/messages.rs	1	known upstream-specific runtime value, pending fix
+crates/amux-server/src/api/reclaim.rs	1	known upstream-specific runtime value, pending fix
+crates/amux-server/src/api/session_verbs.rs	2	known upstream-specific runtime value, pending fix
+crates/amux-server/src/db/board_store.rs	1	known upstream-specific runtime value, pending fix
+crates/amux-server/src/integrations/email.rs	1	known upstream-specific runtime value, pending fix
+crates/amux-server/src/invariants/monitor.rs	1	known upstream-specific runtime value, pending fix
+crates/amux-server/src/runtime_jobs/autofix.rs	1	known upstream-specific runtime value, pending fix
+crates/amux-server/src/runtime_jobs/mac_health.rs	2	known upstream-specific runtime value, pending fix
+scripts/fleet-boot.sh	1	known upstream-specific runtime value, pending fix
+scripts/friction_themes.py	7	known upstream-specific runtime value, pending fix
+scripts/frustration_scan.py	6	known upstream-specific runtime value, pending fix
+scripts/frustrations-archive.py	3	known upstream-specific runtime value, pending fix
+scripts/frustrations_retire.py	1	known upstream-specific runtime value, pending fix
+scripts/hooks/mail-app-guard.py	5	known upstream-specific runtime value, pending fix
+scripts/mac-pressure-tripwire.sh	1	known upstream-specific runtime value, pending fix
+scripts/seo-data.js	1	known upstream-specific runtime value, pending fix
+scripts/token-baseline.py	1	known upstream-specific runtime value, pending fix
