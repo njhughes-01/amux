@@ -28,6 +28,16 @@ done
 if [[ $is_patch -eq 1 ]]; then
   printf '%s\n' "$body" >> "$CAPTURE"
   echo '{"ok":true,"id":"TEST-1","shepherd":"peer-lane"}'
+elif [[ "$*" == *"/api/sessions/ghost-lane"* ]]; then
+  # A peer the fleet has never heard of: `_board_assignee_state` prints
+  # "missing" when the payload has no `name`, and the guard must die.
+  echo '{"error":"no such session"}'
+elif [[ "$*" == *"/api/sessions/"* ]]; then
+  # `_board_assignee_guard` probes the peer before any PATCH and needs a
+  # `name` back; it also refuses on `isolated` or `archived`. Returning the
+  # board-item shape here made the guard read every peer as missing, so the
+  # verb refused and cell 1 saw an empty capture.
+  echo '{"name":"gtm-engine","isolated":false,"archived":false}'
 else
   echo '{"item":{"id":"TEST-1","status":"doing","type":"code"}}'
 fi
@@ -60,6 +70,22 @@ if [ "$rc3" -ne 0 ] && [ ! -s "$TMP/c3" ]; then
   PASS=$((PASS+1))
 else
   FAIL=$((FAIL+1)); echo "FAIL: missing peer must die on usage without PATCHing anything (rc=$rc3): $out3"
+fi
+
+# 4. A peer the fleet has never heard of must die WITHOUT PATCHing.
+#    `_board_assignee_guard` probes GET /api/sessions/<who> first, and this
+#    cell exists because that probe is what broke cell 1: the mock answered
+#    every GET with a board-item shape, the guard read "missing" for a peer
+#    the test meant to be real, and the verb refused. The harness was pinning a
+#    version of the verb that no longer existed, and nothing here said so.
+#    Cells 1 and 4 now hold the guard from both sides, so the next change to it
+#    reddens one of them instead of silently making the suite describe the past.
+export CAPTURE="$TMP/c4"; : > "$CAPTURE"
+out4=$("$AMUX_BIN" board shepherd TEST-1 ghost-lane 2>&1) && rc4=0 || rc4=$?
+if [ "$rc4" -ne 0 ] && [ ! -s "$TMP/c4" ] && printf '%s' "$out4" | grep -qF 'does not exist'; then
+  PASS=$((PASS+1))
+else
+  FAIL=$((FAIL+1)); echo "FAIL: an unknown peer must be refused before any PATCH (rc=$rc4): $out4"
 fi
 
 rm -rf "$TMP"
