@@ -41,12 +41,17 @@ names.
 
 ## Enforcement
 
-`scripts/test-no-hardcoded-specifics.py` runs in CI. It scans runtime files
-(it skips comments, `#[cfg(test)]` modules and test files) for names, emails,
-home paths, handles and LAN addresses. Existing violations are recorded in
-`scripts/fixtures/hardcoded-specifics-baseline.txt`, and that list is a ratchet:
+`scripts/test-no-hardcoded-specifics.py` runs in CI. It scans runtime files and
+the Markdown under `skills/` and `templates/` (lanes read those) for names,
+emails, home paths, handles and LAN addresses. It skips comments (by each
+file's language), Rust `#[cfg(test)]` modules and test files. Existing
+violations are recorded one row per hit in
+`scripts/fixtures/hardcoded-specifics-baseline.txt` (`path<TAB>snippet`), and
+that list is a ratchet by identity:
 
-- a new violation fails CI; move the value into configuration instead;
-- fixing one fails CI until you lower that file's count in the baseline, so
-  the slack cannot be reused;
-- never raise a count or add a file to the baseline to get green.
+- a hit with no matching row fails CI (NEW), even if you fixed a different hit
+  in the same file; move the value into configuration instead;
+- a row whose hit is gone fails CI (STALE) until you delete it, so a fix
+  cannot leave slack behind;
+- on a pull request, a row that the base branch's baseline does not have fails
+  (ADDED): rows can only ever be removed, never added to get green.
