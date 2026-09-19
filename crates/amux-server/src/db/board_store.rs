@@ -2582,7 +2582,7 @@ const DESC_PREFIX_CHARS: usize = 512;
 fn needsyou_marker_sql() -> String {
     const MARKERS: [&str; 9] = [
         "needs-you:", "needs you:", "needsyou:",
-        "needs-ethan:", "needs ethan:", "needsethan:",
+        "needs-owner:", "needs owner:", "needsowner:",
         "needs-human:", "needs human:", "needshuman:",
     ];
     let mut parts: Vec<String> = Vec::new();
