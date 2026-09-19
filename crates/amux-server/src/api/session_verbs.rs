@@ -6253,8 +6253,23 @@ async fn pane_has_live_child(name: &str) -> Option<bool> {
     Some(!ch.stdout.iter().all(|b| b.is_ascii_whitespace()))
 }
 
+fn provider_process_command(provider: &str, claude_cmd: Option<&str>) -> String {
+    if provider == "claude" {
+        if let Some(command) = claude_cmd.and_then(|value| value.split_whitespace().next()) {
+            if let Some(binary) = std::path::Path::new(command).file_name().and_then(|value| value.to_str()) {
+                if !binary.is_empty() {
+                    return binary.to_string();
+                }
+            }
+        }
+    }
+    launch_base_binary(provider).to_string()
+}
+
 fn pane_process_running(command: &str, provider: &str, has_child: Option<bool>) -> bool {
-    command.trim().trim_start_matches('-') == launch_base_binary(provider) || has_child != Some(false)
+    let claude_cmd = (provider == "claude").then(|| std::env::var("AMUX_CLAUDE_CMD").ok()).flatten();
+    command.trim().trim_start_matches('-') == provider_process_command(provider, claude_cmd.as_deref())
+        || has_child != Some(false)
 }
 
 async fn pane_runs_provider(name: &str, provider: &str) -> bool {
@@ -22136,6 +22151,13 @@ mod tests {
             "childless shell remains stopped");
         assert!(super::pane_process_running("bash\n", "claude", Some(true)),
             "shell with provider child remains running");
+        assert_eq!(
+            super::provider_process_command("claude", Some("/opt/amux/bin/claude-wrapper --flag")),
+            "claude-wrapper",
+            "custom Claude launch commands are matched by first-token basename",
+        );
+        assert_eq!(super::provider_process_command("claude", Some("  ")), "claude",
+            "empty custom commands fall back to the default binary");
     }
 
     #[tokio::test]
