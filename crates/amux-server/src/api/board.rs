@@ -3137,7 +3137,7 @@ pub fn list_body(row: &IssueRow, slim: bool, stale: bool) -> Value {
                 let low = l.to_lowercase();
                 // EVERY SPELLING THE CLIENT REGEX ACCEPTS, or the two disagree
                 // about the same card. app.js's _focusAsk uses
-                // /NEEDS[- ]?(?:YOU|OWNER|HUMAN):/i, which admits the space and
+                // /NEEDS[- ]?(?:YOU|OWNER|HUMAN|ETHAN):/i, which admits the space and
                 // no-separator forms for ETHAN and HUMAN too — this list had
                 // only the hyphenated ones, so a card marked "NEEDS ETHAN:"
                 // produced a note in the client and none here. Under slim the
@@ -3148,6 +3148,8 @@ pub fn list_body(row: &IssueRow, slim: bool, stale: bool) -> Value {
                     "needs-you:", "needs you:", "needsyou:",
                     "needs-owner:", "needs owner:", "needsowner:",
                     "needs-human:", "needs human:", "needshuman:",
+                    // Legacy: earlier clients wrote the upstream author's name.
+                    "needs-ethan:", "needs ethan:", "needsethan:",
                 ] {
                     if let Some(p) = low.find(m) {
                         let v = l[p + m.len()..].trim();
@@ -15084,7 +15086,7 @@ mod slim_tests {
         assert!(list_body(&plain, true, false).get("needsyou_note").is_none());
     }
 
-    /// Every spelling app.js's /NEEDS[- ]?(?:YOU|OWNER|HUMAN):/i accepts must
+    /// Every spelling app.js's /NEEDS[- ]?(?:YOU|OWNER|HUMAN|ETHAN):/i accepts must
     /// produce a note here, or the slim client and the full client disagree
     /// about the same card. The three ETHAN/HUMAN space and no-separator forms
     /// were missing until 2026-08-11.
@@ -15095,6 +15097,7 @@ mod slim_tests {
             "NEEDS-OWNER:", "NEEDS OWNER:", "NEEDSOWNER:",
             "NEEDS-HUMAN:", "NEEDS HUMAN:", "NEEDSHUMAN:",
             "needs-you:", "needs owner:",
+            "NEEDS-ETHAN:", "needs ethan:",
         ] {
             let row = IssueRow {
                 id: "X-1".into(),

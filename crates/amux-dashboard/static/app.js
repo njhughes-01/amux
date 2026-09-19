@@ -29186,7 +29186,7 @@ function _focusAsk(item) {
   // NEEDS-YOU marker so a re-marked card shows its freshest question. Only
   // then fall back to the desc's first meaningful line, then the title.
   const hay = (item.desc || '') + '\n' + (item.log || '');
-  const ms = [...hay.matchAll(/NEEDS[- ]?(?:YOU|OWNER|HUMAN):\s*([^\n]+)/ig)];
+  const ms = [...hay.matchAll(/NEEDS[- ]?(?:YOU|OWNER|HUMAN|ETHAN):\s*([^\n]+)/ig)];
   if (ms.length) return ms[ms.length - 1][1].trim().slice(0, 400);
   // desc_head is the slim counterpart of "first meaningful line of desc".
   const d = (item.desc || '').replace(/^\*\*Prompt:\*\*\s*/i, '').split('\n').find(l => l.trim())
