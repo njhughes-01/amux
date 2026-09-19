@@ -179,13 +179,11 @@ DERIVED=0
 # Claude session on the same host then reported as whichever lane was touched
 # last and got its conversation pinned to that lane (review-claude, 2026-09-19).
 # $TMUX_PANE pins the answer to this pane, not the client's current one.
+# Without $TMUX_PANE there is no pane to ask about, and an untargeted query
+# has the same last-used-session answer, so both are required.
 pane_session() {
-  [ -n "${TMUX:-}" ] || return 0
-  if [ -n "${TMUX_PANE:-}" ]; then
-    tmux display-message -p -t "$TMUX_PANE" '#S' 2>/dev/null
-  else
-    tmux display-message -p '#S' 2>/dev/null
-  fi
+  [ -n "${TMUX:-}" ] && [ -n "${TMUX_PANE:-}" ] || return 0
+  tmux display-message -p -t "$TMUX_PANE" '#S' 2>/dev/null
 }
 if [ -z "$AMUX_SESSION" ]; then
   # MR-43: the var can go missing INSIDE a lane that IS running in its

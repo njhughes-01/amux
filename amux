@@ -96,8 +96,8 @@ CC_DEFAULTS="$CC_HOME/defaults.env"
 # $TMUX, `tmux display-message` answers for the server's most recently used
 # session, so a plain operator shell ran every command as that lane.
 _amux_pane_session() {
-  [[ -n "${TMUX:-}" ]] || return 0
-  tmux display-message -p ${TMUX_PANE:+-t "$TMUX_PANE"} '#S' 2>/dev/null || true
+  [[ -n "${TMUX:-}" && -n "${TMUX_PANE:-}" ]] || return 0
+  tmux display-message -p -t "$TMUX_PANE" '#S' 2>/dev/null || true
 }
 if [[ -z "${AMUX_SESSION:-}" ]]; then
   _mr43_tname="$(_amux_pane_session)"

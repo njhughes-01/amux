@@ -155,8 +155,8 @@ if [ -z "$stamp" ]; then
   # Only from inside a pane: outside tmux, display-message answers for the
   # server's most recently used session, naming an unrelated lane.
   _mr43_tname=""
-  if [ -n "${TMUX:-}" ]; then
-    _mr43_tname="$(tmux display-message -p ${TMUX_PANE:+-t "$TMUX_PANE"} '#S' 2>/dev/null)"
+  if [ -n "${TMUX:-}" ] && [ -n "${TMUX_PANE:-}" ]; then
+    _mr43_tname="$(tmux display-message -p -t "$TMUX_PANE" '#S' 2>/dev/null)"
   fi
   case "$_mr43_tname" in
     # Same env-file requirement as the walk above (AMUX-4602): recovering a

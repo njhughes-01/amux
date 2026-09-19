@@ -31,6 +31,8 @@ def main():
     real_run = subprocess.run
     real_tmux = os.environ.get("TMUX")
     os.environ["TMUX"] = "/tmp/tmux-test/default,1,0"
+    real_pane = os.environ.get("TMUX_PANE")
+    os.environ["TMUX_PANE"] = "%7"
     # AMUX-4602: only a name with an env file is a lane. Supply one here so the
     # control does not depend on which lanes this host happens to have.
     real_home = os.environ.get("AMUX_HOME")
@@ -81,6 +83,10 @@ def main():
     subprocess.run = real_run
     if real_tmux is not None:
         os.environ["TMUX"] = real_tmux
+    if real_pane is None:
+        os.environ.pop("TMUX_PANE", None)
+    else:
+        os.environ["TMUX_PANE"] = real_pane
     if real_home is None:
         os.environ.pop("AMUX_HOME", None)
     else:
