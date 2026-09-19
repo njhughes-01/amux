@@ -2048,6 +2048,70 @@ _board_id_guard() {
   esac
 }
 
+# AF-542. `reviewer`/`shepherd` hand a card to a named session with no check
+# that the name can ever act on it — 21 of 24 named reviewers measured
+# unreachable-by-construction (isolated or gone) on 2026-09-07, each one a
+# card silently stuck in `review` forever with nobody able to honor the gate
+# (ethos rule 3: the constraint had no truthful path through for that name).
+#
+# Mirrors push-consent.sh's lane_state(): a lookup that cannot complete must
+# move the verdict toward "unknown", never manufacture a false "ok" (ethos
+# rule 4). Unlike lane_state, "no such session" is its own state here rather
+# than folded into unknown — a typo'd name is refusable outright, where a
+# push-consent probe only ever asks about names that already made a commit.
+_board_assignee_state() {  # -> "ok" | "isolated" | "archived" | "missing" | "unknown:<why>"
+  local who="$1"
+  [[ -z "$AMUX_API" ]] && { echo "unknown:AMUX_URL unset"; return; }
+  local body rc=0
+  body=$(_curl -sk -m 12 "$AMUX_API/api/sessions/$who" 2>/dev/null) || rc=$?
+  [[ "$rc" -ne 0 ]] && { echo "unknown:session lookup failed"; return; }
+  [[ -z "$body" ]] && { echo "unknown:empty response"; return; }
+  printf '%s' "$body" | python3 -c '
+import json, sys
+try:
+    d = json.load(sys.stdin)
+except Exception:
+    print("unknown:unparseable response"); sys.exit()
+if not isinstance(d, dict):
+    print("unknown:unparseable response"); sys.exit()
+if d.get("error") or "name" not in d:
+    print("missing"); sys.exit()
+if d.get("isolated"):
+    print("isolated"); sys.exit()
+if d.get("archived"):
+    print("archived"); sys.exit()
+print("ok")
+'
+}
+
+# Shared by `reviewer` and `shepherd`: both hand a card to a named peer and
+# both were missing this check (same defect, same fix, ethos rule 1 — a gap
+# fixed in one arm and left in its sibling is still the gap).
+_board_assignee_guard() {  # verb who force -> 0 (proceed) | die()s | prints warnings to stderr
+  local verb="$1" who="$2" force="$3"
+  [[ -z "$who" ]] && return 0
+  local state; state=$(_board_assignee_state "$who")
+  case "$state" in
+    missing)
+      die "amux board $verb: session '$who' does not exist — refusing to set it.
+Check the name (amux fleet lists live sessions). A $verb that can never exist
+can never act, so the gate it is meant to satisfy would be stuck shut forever." ;;
+    isolated)
+      if [[ "$force" -ne 1 ]]; then
+        die "amux board $verb: '$who' is an ISOLATED session — it refuses interaction from
+other workers and cannot be reached the normal way to deliver on this. Pass --force
+if you have another route (e.g. the owner relays it) for their sign-off, or name a
+reachable session instead. Same refusal push-consent.sh applies before a push."
+      fi
+      echo "${YELLOW}warning:${RESET} amux board $verb: '$who' is isolated — set anyway (--force). Their sign-off needs a route other than a direct send." >&2 ;;
+    archived)
+      echo "${YELLOW}warning:${RESET} amux board $verb: '$who' is archived (not isolated) — may still be reachable but is not an active lane." >&2 ;;
+    unknown:*)
+      echo "${YELLOW}warning:${RESET} amux board $verb: could not confirm '$who' is reachable (${state#unknown:}) — proceeding anyway." >&2 ;;
+  esac
+  return 0
+}
+
 
 # Typed approval categories, narrowed by the effective server-side scope policy.
 #
@@ -3444,9 +3508,19 @@ print(json.dumps(b))' \
       # just the ones someone tripped over.
       local id="${1:-}"; local who="${2:-}"
       _board_id_guard "reviewer" "$id"
-      [[ -n "$id" && -n "$who" ]] || die "Usage: amux board reviewer <ISSUE-ID> <session>   (pass 'none' to clear)
-Sets the session whose sign-off is required for review -> done."
+      [[ -n "$id" && -n "$who" ]] || die "Usage: amux board reviewer <ISSUE-ID> <session> [--force]   (pass 'none' to clear)
+Sets the session whose sign-off is required for review -> done.
+--force: set it even if the session is isolated (see the refusal this overrides)."
+      shift 2
+      local _force=0
+      while [[ $# -gt 0 ]]; do
+        case "$1" in
+          --force) _force=1; shift ;;
+          *) die "Usage: amux board reviewer <ISSUE-ID> <session> [--force]" ;;
+        esac
+      done
       [[ "$who" == "none" ]] && who=""
+      _board_assignee_guard "reviewer" "$who" "$_force"
       local result
       result=$(R="$who" python3 -c 'import json,os;print(json.dumps({"reviewer":os.environ["R"]}))' \
         | _curl -sk -X PATCH -H 'Content-Type: application/json' \
@@ -3468,9 +3542,19 @@ Sets the session whose sign-off is required for review -> done."
       # not a raw PATCH (ethos rule 6's unaudited back door).
       local id="${1:-}"; local who="${2:-}"
       _board_id_guard "shepherd" "$id"
-      [[ -n "$id" && -n "$who" ]] || die "Usage: amux board shepherd <ISSUE-ID> <session>   (pass 'none' to clear)
-Names the peer this card is handed off to, without moving it onto their board."
+      [[ -n "$id" && -n "$who" ]] || die "Usage: amux board shepherd <ISSUE-ID> <session> [--force]   (pass 'none' to clear)
+Names the peer this card is handed off to, without moving it onto their board.
+--force: set it even if the session is isolated (see the refusal this overrides)."
+      shift 2
+      local _force=0
+      while [[ $# -gt 0 ]]; do
+        case "$1" in
+          --force) _force=1; shift ;;
+          *) die "Usage: amux board shepherd <ISSUE-ID> <session> [--force]" ;;
+        esac
+      done
       [[ "$who" == "none" ]] && who=""
+      _board_assignee_guard "shepherd" "$who" "$_force"
       local result
       result=$(S="$who" python3 -c 'import json,os;print(json.dumps({"shepherd":os.environ["S"]}))' \
         | _curl -sk -X PATCH -H 'Content-Type: application/json' \
