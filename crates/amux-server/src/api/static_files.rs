@@ -597,6 +597,10 @@ mod tests {
         // $HOME. A parallel test points HOME at a macOS tempdir under
         // /var/folders, which contains "old", so this failed on local runs.
         assert!(!out.contains("STALE-BOOTSTRAP-PLACEHOLDER"), "placeholder block replaced: {out}");
+        // The served owner is the resolver's answer for this home, JSON-quoted.
+        let owner = crate::api::settings::owner_name(&crate::config::amux_home());
+        let want = format!("window._AMUX_OWNER_NAME={};", serde_json::to_string(&owner).unwrap());
+        assert!(out.contains(&want), "bootstrap must serve the owner name: {out}");
     }
 
     #[test]

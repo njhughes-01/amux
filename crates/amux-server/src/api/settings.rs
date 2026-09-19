@@ -90,27 +90,59 @@ pub(crate) fn effective_env(home: &Path, key: &str) -> Option<String> {
 /// record every dashboard decision as the upstream author's, and lanes rightly
 /// refused those as approvals from a stranger.
 pub(crate) fn owner_name(home: &Path) -> String {
+    let (name, source) = resolve_owner_name(
+        effective_env(home, "AMUX_OWNER_NAME"),
+        || {
+            std::process::Command::new("git")
+                .args(["config", "--global", "--get", "user.name"])
+                .output()
+                .ok()
+                .filter(|o| o.status.success())
+                .and_then(|o| String::from_utf8(o.stdout).ok())
+        },
+        |k| std::env::var(k).ok(),
+    );
+    // A fallback can name the wrong person: the global git identity may be an
+    // automation account, and the login is often a service user. Say so once
+    // per process, where a log sweep will find it.
+    static WARNED: std::sync::Once = std::sync::Once::new();
+    if source != "AMUX_OWNER_NAME" {
+        WARNED.call_once(|| {
+            tracing::warn!(
+                owner = %name,
+                source,
+                "AMUX_OWNER_NAME is not set; cards and messages name the owner from a fallback. \
+                 Set AMUX_OWNER_NAME in ~/.amux/server.env"
+            );
+        });
+    }
+    name
+}
+
+/// `owner_name`'s resolution over injected sources, so it is testable without
+/// touching the process env or the machine's git config. Returns the name and
+/// which source supplied it.
+pub(crate) fn resolve_owner_name(
+    configured: Option<String>,
+    git_user_name: impl FnOnce() -> Option<String>,
+    env: impl Fn(&str) -> Option<String>,
+) -> (String, &'static str) {
     let clean = |v: String| {
         let v = v.trim().to_string();
         (!v.is_empty()).then_some(v)
     };
-    if let Some(v) = effective_env(home, "AMUX_OWNER_NAME").and_then(clean) {
-        return v;
+    if let Some(v) = configured.and_then(clean) {
+        return (v, "AMUX_OWNER_NAME");
     }
-    let git = std::process::Command::new("git")
-        .args(["config", "--global", "--get", "user.name"])
-        .output()
-        .ok()
-        .filter(|o| o.status.success())
-        .and_then(|o| String::from_utf8(o.stdout).ok())
-        .and_then(clean);
-    if let Some(v) = git {
-        return v;
+    if let Some(v) = git_user_name().and_then(clean) {
+        return (v, "git user.name");
     }
-    ["USER", "LOGNAME"]
-        .iter()
-        .find_map(|k| std::env::var(k).ok().and_then(clean))
-        .unwrap_or_else(|| "owner".to_string())
+    for k in ["USER", "LOGNAME"] {
+        if let Some(v) = env(k).and_then(clean) {
+            return (v, "login");
+        }
+    }
+    ("owner".to_string(), "default")
 }
 
 /// Python's server.env line-replace: rewrite the first `KEY=`/`KEY =` line,
@@ -969,10 +1001,24 @@ mod tests {
         assert_eq!(owner_name(dir.path()), "Nathan");
         set_server_env_key(dir.path(), "AMUX_OWNER_NAME", "Someone Else").unwrap();
         assert_eq!(owner_name(dir.path()), "Someone Else", "must re-read server.env at use");
-        set_server_env_key(dir.path(), "AMUX_OWNER_NAME", "").unwrap();
-        let fallback = owner_name(dir.path());
-        assert!(!fallback.trim().is_empty(), "fallback must name someone");
-        assert_ne!(fallback, "Ethan", "fallback must come from this machine, not upstream");
+    }
+
+    /// Each fallback step, from controlled sources only: the machine's own git
+    /// identity and login never decide this test.
+    #[test]
+    fn owner_name_falls_back_to_git_then_login_then_a_generic_word() {
+        let none = |_: &str| None;
+        assert_eq!(
+            resolve_owner_name(Some("  ".into()), || Some("Git Person\n".into()), none),
+            ("Git Person".to_string(), "git user.name")
+        );
+        let login = |k: &str| (k == "LOGNAME").then(|| "casey".to_string());
+        assert_eq!(resolve_owner_name(None, || None, login), ("casey".to_string(), "login"));
+        assert_eq!(resolve_owner_name(None, || Some(" ".into()), none), ("owner".to_string(), "default"));
+        assert_eq!(
+            resolve_owner_name(Some("Pat".into()), || Some("Git Person".into()), login),
+            ("Pat".to_string(), "AMUX_OWNER_NAME")
+        );
     }
 
 

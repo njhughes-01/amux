@@ -28574,9 +28574,14 @@ function _bqSessionIndex() {
 // The owner's name comes from the server (AMUX_OWNER_NAME, else git
 // user.name, else the login), never a baked-in person.
 function _ownerName() { return (window._AMUX_OWNER_NAME || '').trim() || 'owner'; }
+// LEGACY_HUMAN_TAGS were written by earlier clients under the upstream
+// author's name. They stay readable (and clearable) so existing cards do not
+// drop out of Focus mode; nothing writes them any more.
+const _LEGACY_HUMAN_TAGS = ['needs:ethan', 'awaiting-ethan'];
 const _NEEDS_HUMAN_TAGS = new Set(['needs:you', 'needs:human', 'needs:owner',
   'blocked:human', 'human-gated', 'awaiting-decision', 'awaiting-owner',
-  'needs:' + _ownerName().toLowerCase(), 'awaiting-' + _ownerName().toLowerCase()]);
+  'needs:' + _ownerName().toLowerCase(), 'awaiting-' + _ownerName().toLowerCase(),
+  ..._LEGACY_HUMAN_TAGS]);
 
 function _bqIs(item, val, ix) {
   const st = _statusCanon(item.status);

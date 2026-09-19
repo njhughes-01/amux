@@ -1567,7 +1567,7 @@ fn the_mdai_viewer_resolves_paths_against_the_scan_root() {
 fn dashboard_records_the_configured_owner_not_a_baked_in_name() {
     let app = asset("app.js");
     assert!(app.contains("window._AMUX_OWNER_NAME"), "app.js must read the served owner name");
-    for bad in ["'[Ethan", "`answered` Ethan", "`decision` Ethan", "`nudge` Ethan", "'needs:ethan'", "'awaiting-ethan'", "did Ethan ask"] {
+    for bad in ["'[Ethan", "`answered` Ethan", "`decision` Ethan", "`nudge` Ethan", "did Ethan ask"] {
         assert!(!app.contains(bad), "app.js still hardcodes the upstream owner: {bad}");
     }
     let src = std::fs::read_to_string(
