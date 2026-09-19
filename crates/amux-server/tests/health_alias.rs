@@ -65,8 +65,33 @@ async fn exhausted_read_pool_keeps_health_identity_and_runtime_responsive() {
         store: store.clone(), started: std::time::Instant::now(), build_hash: "pinned-image".into(),
         auth_token: None, reconciled: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
     };
+    // AF-933: `min_idle(1)` (AMUX-4739) means the pool starts with ONE real
+    // connection and grows the rest lazily, on demand, the first time each
+    // is actually requested -- it does not pre-create up to max_size at
+    // `Store::open`. A single linear `while let Some(conn) = try_read()`
+    // pass can therefore stop early: the 2nd/3rd/4th `try_read()` each need
+    // r2d2 to open and configure a brand-new SQLite connection before they
+    // can succeed, and on a slower disk (measured flaky on GitHub Actions,
+    // reliable on this box's local SSD) that creation can still be
+    // in-flight when `try_get`'s effectively-zero wait gives up, returning
+    // None while real capacity remains unclaimed. The old `assert!(!held.is_empty())`
+    // could not catch this: ANY nonzero drain passes it, so the test
+    // proceeded believing the pool was exhausted when 1-3 slots were still
+    // free, and the later health() call could legitimately succeed (200)
+    // against a pool that was never actually saturated.
+    //
+    // Retry on a miss instead of stopping at the first one, so lazy
+    // connection creation has a chance to finish; only give up after
+    // several CONSECUTIVE misses, which is what actual exhaustion looks
+    // like once the pool has finished growing.
     let mut held = Vec::new();
-    while let Some(conn) = store.try_read() { held.push(conn); }
+    let mut consecutive_misses = 0;
+    while consecutive_misses < 20 {
+        match store.try_read() {
+            Some(conn) => { held.push(conn); consecutive_misses = 0; }
+            None => { consecutive_misses += 1; std::thread::sleep(std::time::Duration::from_millis(5)); }
+        }
+    }
     assert!(!held.is_empty());
     // Simulate fleet work borrowing every connection. A real OS thread releases
     // them even if the old synchronous health handler blocks the entire runtime.
