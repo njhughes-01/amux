@@ -1939,6 +1939,8 @@ fn drainable_backlog_rows(conn: &Connection, session: &str, now: f64) -> rusqlit
            AND NOT {CAPTURE} \
            AND NOT EXISTS (SELECT 1 FROM issue_tags t WHERE t.issue_id=i.id \
                            AND lower(t.tag) LIKE 'needs:you%') \
+           AND NOT EXISTS (SELECT 1 FROM issue_tags t WHERE t.issue_id=i.id \
+                           AND lower(t.tag) = 'defer:focused') \
            AND NOT EXISTS (SELECT 1 FROM session_events e WHERE e.type='task.claimed' \
                            AND e.ts > ?2 AND e.data LIKE '%\"' || i.id || '\"%') \
            AND NOT (COALESCE(i.source_ref,'') <> '' AND COALESCE(i.last_verified_at,0) > ?3) \
@@ -2011,6 +2013,21 @@ fn drainable_backlog_count(conn: &Connection, session: &str, now: f64) -> usize 
 /// CANNOT serve this purpose — `source_ref` is on 93% of backlog cards and a
 /// future `due` on 65%, because both are auto-populated, so excluding on either
 /// would silence ~65% of the drain (AF-514).
+///
+/// A `defer:focused` TAG is excluded for the same reason (AF-514, decided:
+/// option 1, "a tag... excluded by drainable_backlog_ids the way `needs:you`
+/// already is"). mixpeek-studio's MS-1331/MS-1314/MS-1275 each auto-drained
+/// 3+ times a day and re-parked each time: their real deferral horizon is
+/// weeks, but the only existing lever with any teeth (`source_ref` +
+/// `last_verified_at` within `SOURCE_REF_STALE_S`, 24h) caps the honest
+/// horizon at a day, so they had to re-affirm daily and each affirmation cost
+/// a drain-and-re-park cycle. A tag is rare by construction the same way
+/// `blocked_on` is: nothing sets it by default, a lane sets it deliberately
+/// per card, and setting it costs nothing but is never automatic — unlike
+/// `source_ref`/`due`, which amux itself populates on most backlog cards
+/// regardless of intent. `PATCH /api/board/<ID>` with `{"tags":[...,
+/// "defer:focused"]}` (or without it, to clear) is the whole interface; no
+/// new column, no new verb, no CLI shorthand yet.
 fn oldest_drainable_backlog(conn: &Connection, session: &str, now: f64, continuation_gate: bool) -> Option<String> {
     drainable_backlog_ids(conn, session, now).into_iter().find(|id| {
         !continuation_gate || bs::get_issue(conn, id).ok().flatten().is_some_and(|row|
@@ -11126,6 +11143,67 @@ mod tests {
             backlog_candidates(&conn, "blk", now as i64).into_iter().map(|c| c.0).collect();
         assert_eq!(listed, vec!["BL-2".to_string()], "an unblocked card must still drain");
         assert_eq!(drainable_backlog_ids(&conn, "blk", now), vec!["BL-2".to_string()]);
+    }
+
+    /// AF-514. mixpeek-studio's MS-1331/MS-1314/MS-1275 each auto-drained 3+
+    /// times a day: their real deferral horizon is weeks, but the only lever
+    /// with any teeth (`source_ref` + a `last_verified_at` inside
+    /// `SOURCE_REF_STALE_S`, 24h) capped what they could honestly express at
+    /// a day, so they had to re-affirm daily and each affirmation cost a
+    /// drain-and-re-park cycle. Measured on the live board before this: gating
+    /// on `source_ref` (93% of backlog) or a future `due` (65%) would each
+    /// silence most of the drain fleet-wide — a signal everything carries
+    /// cannot mark anything. `defer:focused` is rare by construction instead:
+    /// nothing sets it by default, so its own test does not need a "does this
+    /// silence the drain" control the way `blocked_on`'s does — a tag is
+    /// opt-in the same way `--on` naming a cause is.
+    #[test]
+    fn a_card_tagged_defer_focused_is_not_drainable_regardless_of_source_ref_or_due() {
+        let conn = board_db();
+        let now = now_f64();
+        add_card(&conn, "MS-1", "studio", "backlog", "large focused turn", "SCOPE: x");
+        tag(&conn, "MS-1", "defer:focused", now);
+        assert!(
+            drainable_backlog_ids(&conn, "studio", now).is_empty(),
+            "a defer:focused card must never be offered to the drain"
+        );
+
+        // THE POINT OF THIS CARD, pinned directly: neither existing lever
+        // changes the verdict, because neither is what is excluding it.
+        conn.execute(
+            "UPDATE issues SET source_ref='not needed for weeks', last_verified_at=?1, \
+             due=date('now') WHERE id='MS-1'",
+            rusqlite::params![now as i64],
+        )
+        .unwrap();
+        assert!(
+            drainable_backlog_ids(&conn, "studio", now).is_empty(),
+            "a fresh source_ref or an arrived due date must not override the tag"
+        );
+
+        // THE CONTROL: removing the tag (the only interface -- PATCH tags,
+        // no new column) makes it drainable again, same as any ordinary card.
+        // Also clears the fresh source_ref set above -- otherwise THAT lever
+        // alone would still exclude it, and this cell would prove nothing
+        // about the tag specifically.
+        conn.execute("DELETE FROM issue_tags WHERE issue_id='MS-1'", []).unwrap();
+        conn.execute("UPDATE issues SET source_ref='', last_verified_at=NULL WHERE id='MS-1'", []).unwrap();
+        assert_eq!(
+            drainable_backlog_ids(&conn, "studio", now),
+            vec!["MS-1".to_string()],
+            "clearing the tag must restore ordinary drain eligibility"
+        );
+
+        // AND A DIFFERENT TAG must not accidentally match -- this excludes an
+        // exact tag, not a prefix the way needs:you% does, so a lane naming
+        // something merely SIMILAR does not silently get the same exclusion.
+        add_card(&conn, "MS-2", "studio", "backlog", "unrelated work", "SCOPE: x");
+        tag(&conn, "MS-2", "defer:focused-ish", now);
+        assert_eq!(
+            drainable_backlog_ids(&conn, "studio", now),
+            vec!["MS-1".to_string(), "MS-2".to_string()],
+            "a tag that merely starts with defer:focused must not match the exact exclusion"
+        );
     }
 
     #[test]
