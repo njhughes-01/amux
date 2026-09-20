@@ -17,15 +17,16 @@ for(const surface of ['card','details'] as const) for(const mode of ['Send','Que
   const open=async()=>{
     await page.goto('/');if(await page.locator('#peek-overlay.active').isVisible())await page.getByRole('button',{name:'Close worker',exact:true}).click();const card=page.locator(`#cards .card[data-session="${name}"]`).locator('visible=true').first();
     if(surface==='card'){await card.locator('.card-name').click();return card;}
-    // The worker list re-renders on every /api/sessions poll, so the menu
-    // button is replaced underneath a click that is mid-flight — Playwright
-    // reports "element was detached from the DOM, retrying" until the action
-    // times out, and ios-safari is slow enough to lose that race every time.
-    // Re-resolve and re-click until the menu is actually open, with a short
-    // per-attempt timeout: bounded, and it still fails if the menu never opens.
+    // The peek overlay from the previous surface is still on screen and its
+    // controls sit over the card, so the click lands on
+    // `.peek-output-controls` instead of the menu button. The close above is
+    // issued but not awaited to completion, and ios-safari is slow enough to
+    // lose that race every time. Wait for the overlay to be GONE before
+    // touching the card underneath it.
+    await expect(page.locator('#peek-overlay.active')).toHaveCount(0);
     const menuBtn=card.locator('.card-menu-btn');await expect(menuBtn).toBeVisible();
-    const menu=page.locator('.card-menu.open');
-    await expect(async()=>{await menuBtn.click({timeout:2_000});await expect(menu).toBeVisible({timeout:2_000});}).toPass({timeout:30_000});
+    await menuBtn.click();
+    const menu=page.locator('.card-menu.open');await expect(menu).toBeVisible();
     await menu.locator('[data-worker-action="peek-terminal"]').click();return page.locator('#peek-overlay');
   };
   const queue=()=>page.evaluate(name=>JSON.parse(localStorage.getItem('amux_offline_queue')||'[]').filter((q:any)=>q.url.includes('/'+name+'/')),name);
