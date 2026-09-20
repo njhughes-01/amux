@@ -28,6 +28,10 @@
 #   scripts/mac-cleanup-tick.sh --dry-run   # measure, act on nothing
 set -uo pipefail
 
+# macOS only: every tool below (purge/vm_stat/tmutil) is Darwin's. Refuse loudly
+# elsewhere rather than swallowing the errors and reporting "nothing measured".
+[ "$(uname -s)" = Darwin ] || { echo "$(basename "$0"): macOS only (this is $(uname -s)) — nothing measured" >&2; exit 0; }
+
 # launchd's PATH has no /usr/sbin, and sysctl/purge/vm_stat live there. Its
 # sibling mac-pressure-tripwire.sh reported measured=false for exactly this
 # reason (AMUX-4661), so this one exports the PATH before any probe runs.
