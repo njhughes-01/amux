@@ -254,6 +254,8 @@ jobs:
         run: bash scripts/spa-lint.sh
       - name: Dashboard outage recovery contracts
         run: node --test tests/dashboard-outage-recovery.mjs
+      - name: No assignment to an undeclared client-side global (AF-940)
+        run: node --test tests/spa-no-undeclared-global-assignment.test.mjs
       # The CI checkout IS committed HEAD, so serve-head's worktree hop is
       # pure duplicate work here — and worse: without these env vars the
       # prebuild below went to ./target while serve-head defaulted to
