@@ -36,10 +36,6 @@
 #   scripts/mac-pressure-tripwire.sh --dry-run # never page, just print
 set -uo pipefail
 
-# macOS only: every tool below (vm_stat/sysctl/launchctl) is Darwin's. Refuse loudly
-# elsewhere rather than swallowing the errors and reporting "nothing measured".
-[ "$(uname -s)" = Darwin ] || { echo "$(basename "$0"): macOS only (this is $(uname -s)) — nothing measured" >&2; exit 0; }
-
 # `sysctl` lives in /usr/sbin, which is NOT on the PATH this runs under, so both
 # the pressure level and the swap reading came back empty and two of the three
 # thresholds could never trip (AMUX-4661). Measured on this box: the running
