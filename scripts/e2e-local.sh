@@ -38,14 +38,41 @@ done
 # One playwright run at a time per port block. A stray run from another shell
 # owns ports this one would take, and the failure would look like a flaky
 # webServer timeout rather than a collision.
-if pgrep -f "playwright test" >/dev/null 2>&1; then
+# The bracket keeps the pattern from matching THIS script's own command line
+# (or a waiting wrapper's), which is a wait that never ends — measured, not
+# hypothetical: a queued run sat for 40 minutes matching itself.
+if pgrep -f "[p]laywright test" >/dev/null 2>&1; then
   echo "refusing: a playwright run is already active (pgrep -f 'playwright test')." >&2
   echo "  Wait for it, or pass a different --out and offsets by hand." >&2
   exit 2
 fi
 
+# Which projects can actually RUN here. The ios-safari project is webkit, and
+# webkit needs system libraries that a developer box may not have (CI installs
+# them with `playwright install --with-deps`). Without this probe every one of
+# its tests fails at browserType.launch and the run reports hundreds of
+# failures that say nothing about the code — measured: 356 of them in one run,
+# with the real result buried under the noise. Probe, then say so once.
+PROJECTS="${AMUX_E2E_PROJECTS:-}"
+if [ -z "$PROJECTS" ]; then
+  PROJECTS="desktop mobile ios-safari"
+  # Launch AND close. `playwright launch-server` blocks when it succeeds, so it
+  # would report a working webkit as broken — the probe has to be able to
+  # answer both ways (chromium is the control: it launches here, webkit does not).
+  if ! timeout 90 node -e "require('playwright').webkit.launch().then(b => b.close()).then(() => process.exit(0), () => process.exit(1))" >/dev/null 2>&1; then
+    PROJECTS="desktop mobile"
+    echo "note: skipping the ios-safari project — webkit cannot launch on this host"
+    echo "      (missing system libraries; CI covers it). To include it:"
+    echo "      sudo npx playwright install-deps webkit   # then re-run"
+    echo "      Override with AMUX_E2E_PROJECTS='desktop mobile ios-safari'."
+  fi
+fi
+PROJECT_ARGS=""
+for p in $PROJECTS; do PROJECT_ARGS="$PROJECT_ARGS --project=$p"; done
+
 mkdir -p "$OUT"
 echo "e2e local: $SHARDS shards x $WORKERS workers on $CORES cores -> $OUT"
+echo "  projects: $PROJECTS"
 [ $# -gt 0 ] && echo "  playwright args: $*"
 
 # Build ONCE before the shards start. They share one CARGO_TARGET_DIR, so
@@ -65,7 +92,7 @@ for i in $(seq 1 "$SHARDS"); do
   offset=$(( i * 100 ))
   AMUX_E2E_WORKING_TREE=1 AMUX_E2E_PORT_OFFSET="$offset" \
     npx playwright test --config e2e/playwright.config.ts \
-      --shard="$i/$SHARDS" --workers="$WORKERS" --reporter=line "$@" \
+      --shard="$i/$SHARDS" --workers="$WORKERS" --reporter=line $PROJECT_ARGS "$@" \
       > "$OUT/shard-$i.log" 2>&1 &
   pids+=("$!")
 done
