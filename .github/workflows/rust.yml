@@ -47,6 +47,14 @@ concurrency:
   group: rust-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 
+# Playwright projects CI runs. ios-safari (WebKit) is BACKLOGGED on this fork:
+# the owner uses no iOS/Safari device, and its failures were blocking every PR.
+# The project still exists in e2e/playwright.config.ts, and the config prints
+# "ios-safari: NOT RUN" on every run, so its absence is never silent. Restore it
+# by adding it back here (see the backlog card that parked it).
+env:
+  E2E_PROJECTS: desktop mobile
+
 jobs:
   check:
     runs-on: ubuntu-latest
@@ -223,23 +231,21 @@ jobs:
           path: ~/.cache/ms-playwright
           key: playwright-${{ runner.os }}-${{ hashFiles('package-lock.json') }}
       - name: Install Playwright
-        # webkit is NOT optional: the ios-safari project (devices['iPhone 15'])
-        # is a webkit project, and this job runs EVERY project (no --project
-        # filter below). A missing browser is a hard error, not a skip:
-        # "browserType.launch: Executable doesn't exist at .../webkit-2336".
-        # Installing it here rather than gating the project to skip is
-        # deliberate — a skipping ios-safari target reads as covered and is
-        # worse than none, and the whole reason that project exists is that
-        # desktop+mobile chromium at 375px went green while the real phone was
-        # broken (AMUX-3057).
+        # WebKit is installed only when E2E_PROJECTS includes ios-safari (the
+        # WebKit project, devices['iPhone 15']). It exists because desktop+mobile
+        # Chromium at 375px went green while a real phone was broken (AMUX-3057);
+        # it is backlogged on this fork, not deleted, and a missing browser for a
+        # project that IS listed is still a hard error, never a skip.
         # On a cache hit only the OS deps are installed (they live outside the
         # cached path); the browser download itself is skipped.
         run: |
           npm ci --ignore-scripts 2>/dev/null || npm install
+          browsers=chromium
+          case " $E2E_PROJECTS " in *" ios-safari "*) browsers="chromium webkit" ;; esac
           if [ "${{ steps.pw-cache.outputs.cache-hit }}" = "true" ]; then
-            npx playwright install-deps chromium webkit
+            npx playwright install-deps $browsers
           else
-            npx playwright install --with-deps chromium webkit
+            npx playwright install --with-deps $browsers
           fi
       - name: SPA static gate (no-undef kills the silent-dead-handler class)
         # Two silent-dead-handler bugs shipped in one week (schedule delete,
@@ -259,8 +265,8 @@ jobs:
         run: cargo build -p amux-server
         env:
           CARGO_TARGET_DIR: ${{ github.workspace }}/target
-      - name: Golden scenarios (desktop + mobile + ios-safari)
-        run: npx playwright test --config e2e/playwright.config.ts --workers=2 --shard=${{ matrix.shard }}/4 --global-timeout=1200000
+      - name: Golden scenarios (the E2E_PROJECTS targets)
+        run: npx playwright test --config e2e/playwright.config.ts $(printf -- '--project=%s ' $E2E_PROJECTS) --workers=2 --shard=${{ matrix.shard }}/4 --global-timeout=1200000
         env:
           AMUX_E2E_EVIDENCE_DIR: ci-results/shard-${{ matrix.shard }}
           AMUX_E2E_WORKING_TREE: '1'
@@ -294,7 +300,7 @@ jobs:
         with: { node-version: '22' }
       - run: npm ci --ignore-scripts
       - name: Collect the full unchanged population (no execution claim)
-        run: npx playwright test --config e2e/playwright.config.ts --list
+        run: npx playwright test --config e2e/playwright.config.ts $(printf -- '--project=%s ' $E2E_PROJECTS) --list
         env:
           AMUX_E2E_EVIDENCE_DIR: ci-full
       - uses: actions/download-artifact@v4
