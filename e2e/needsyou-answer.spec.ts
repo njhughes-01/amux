@@ -29,7 +29,20 @@ test('a typed Focus answer keeps every key and moves the card out of needs-you',
   const id = await parkedCard(request, auth, 'focus answer e2e subject');
   const owner = await page.evaluate(() => (window as any)._ownerName());
 
-  await page.evaluate(async () => { await (window as any).fetchBoard(); (window as any)._focusStart('is:needsyou'); });
+  // Focus lists what the dashboard's board holds. On a slow shard one refresh
+  // could still predate the card, and an empty Focus opens nothing at all.
+  await expect.poll(() => page.evaluate(async (cid) => {
+    await (window as any).fetchBoard();
+    return (eval('boardItems') as any[]).some(i => i.id === cid && i.status === 'needsyou');
+  }, id)).toBe(true);
+  // Other specs park their own cards on the same server, so this one is not
+  // necessarily first in Focus: open Focus, then step to it.
+  await page.evaluate((cid) => {
+    (window as any)._focusStart('is:needsyou');
+    const list = eval('_focusList') as any[];
+    eval('_focusIdx = ' + list.findIndex(i => i.id === cid));
+    (window as any)._focusRender();
+  }, id);
   await expect(page.locator('#focus-overlay')).toContainText(id);
   await page.keyboard.press('e');
   const box = page.locator('#focus-ans');

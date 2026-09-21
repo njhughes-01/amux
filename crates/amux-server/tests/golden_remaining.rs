@@ -576,8 +576,20 @@ async fn golden_rate_limit_recovery() {
         })
         .await;
     }
+    // The durable state can reach Idle before its broadcast is drained, so a
+    // single drain raced the last event on slow CI runners. Keep draining
+    // until the idle event arrives (bounded); the assertion stays exact.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        journal.extend(drain(&mut rx));
+        if worker_status_seq(&journal, &wid).last().map(String::as_str) == Some("idle")
+            || std::time::Instant::now() > deadline
+        {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
     processor.abort();
-    journal.extend(drain(&mut rx));
 
     // The FULL journal sequence. Worker state arc, in order: mid-task ->
     // turn killed -> parked -> recovered -> resumed turn -> idle.
