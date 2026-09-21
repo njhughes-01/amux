@@ -11223,7 +11223,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.979';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.980';   // bump together with the sw.js CACHE version
 // Warm the shared catalog so model-type filters are exact on first use. A
 // failure is non-fatal (custom ids and the open-string fallback still work)
 // and is already reported by _loadModelCatalog.
@@ -28655,9 +28655,9 @@ function _bqIs(item, val, ix) {
                        // re-nag JOINs issue_tags, so nothing handed it out and
                        // nothing brought it back. Measured 2026-08-11: 23 of 38
                        // open needsyou cards were invisible to this view, incl.
-                       // four SLA breaches aged 127-194h. The server now stamps
-                       // the tag on the transition too; this arm is what surfaces
-                       // the ones already sitting in that state, without a sweep.
+                       // four SLA breaches aged 127-194h. The server does NOT
+                       // stamp a tag on the transition (checked 2026-09-21), so
+                       // this status arm is what surfaces them.
                        st === 'needsyou'
                        // Explicit marker set by whoever knows (a session parking
                        // its card, or a human reassigning a decision) — NOT every
@@ -28665,9 +28665,15 @@ function _bqIs(item, val, ix) {
                        // floods the queue (306 -> the real blocked set). Own
                        // filed work lives in the Mine view; needs-you is only
                        // what is actively stopped ON you.
-                       || (item.tags || []).some(t => _NEEDS_HUMAN_TAGS.has(String(t).toLowerCase()))
-                       || (!!sess && (sess.status === 'waiting'
-                                      || !!sess.credit_limited || !!sess.rate_limited_until)));
+                       || (item.tags || []).some(t => _NEEDS_HUMAN_TAGS.has(String(t).toLowerCase())));
+                       // NOT the owning LANE's state (LC-29). An arm here also
+                       // counted every open card of a lane whose status read
+                       // `waiting` or rate-limited. An idle Codex lane reads
+                       // `waiting` at its prompt, so its backlog and todo cards
+                       // filled Focus: "approve" on them changed nothing, and
+                       // each pass showed a different set. A lane state is not
+                       // a question to the owner; the server's needs-you queue
+                       // (/api/board/needsyou) is the status alone.
     case 'offline':  return !!item.session && (!sess || !sess.running);
     case 'orphan':   return !item.session || !ix[item.session];
     case 'archived': return !!item.archived;
@@ -29268,27 +29274,46 @@ async function _focusResolveTag(item) {
   const keep = (item.tags || []).filter(t => !_NEEDS_HUMAN_TAGS.has(String(t).toLowerCase()));
   await _focusPatch(item.id, { tags: keep });
 }
+// ANSWER A NEEDS-YOU CARD (LC-29). One server call records the answer under
+// the owner's name, moves the card back to the worker's todo, clears the ask
+// and delivers the answer through the durable queue. The browser used to do
+// the pieces itself and never changed the STATUS, so an answered card came
+// straight back in Focus and nothing moved. Returns the server's result, or
+// null when nothing was recorded (apiCall has already shown why).
+async function _answerAsk(item, verdict) {
+  let text = '';
+  if (verdict === 'answered') {
+    const sess = item.session;
+    const ok = await showFormModal('Answer ' + item.id + (sess ? ' \u2192 ' + sess : ''),
+      '<textarea id="focus-ans" class="bw-in" style="width:100%;min-height:90px;box-sizing:border-box" '
+      + 'placeholder="Your reply — sent to the owning worker and recorded on the card"></textarea>', 'Send');
+    text = ((document.getElementById('focus-ans') || {}).value || '').trim();
+    if (!ok || !text) return null;
+  }
+  const r = await apiCall(API + '/api/board/' + encodeURIComponent(item.id) + '/answer', {
+    method: 'POST', headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({ verdict, text }) });
+  if (!r) return null;
+  const d = r.delivery || {};
+  showToast(item.id + ' ' + verdict + ' \u2192 back to ' + (item.session || 'the queue')
+    + (d.attempted && d.refused ? ' (not delivered: ' + (d.message || 'refused') + ')' : ''));
+  try { await fetchBoard(); } catch (e) {}
+  return r;
+}
+// The card detail's Human request buttons: the same answer as Focus.
+async function _bdAnswer(id, verdict) {
+  const item = (boardItems || []).find(i => i.id === id); if (!item) return;
+  if (await _answerAsk(item, verdict)) _openIssue(id);
+}
 async function _focusAnswer() {
   const item = _focusList[_focusIdx]; if (!item) return;
-  const sess = item.session;
-  const ok = await showFormModal('Answer ' + item.id + (sess ? ' \u2192 ' + sess : ''),
-    '<textarea id="focus-ans" class="bw-in" style="width:100%;min-height:90px;box-sizing:border-box" '
-    + 'placeholder="Your reply — sent to the owning worker and recorded on the card"></textarea>', 'Send');
-  const ans = (document.getElementById('focus-ans') || {}).value || '';
-  if (!ok || !ans.trim()) return;
-  if (sess) { try { await _focusSend(sess, '[' + _ownerName() + ', re ' + item.id + '] ' + ans); } catch(e) {} }
-  await _focusPatch(item.id, { desc_append: '`answered` ' + _ownerName() + ': ' + ans });
-  await _focusResolveTag(item);
-  showToast('Answered ' + item.id);
+  if (!await _answerAsk(item, 'answered')) return;
   _focusRebuild(); if (_focusIdx >= _focusList.length) _focusIdx = _focusList.length - 1;
   _focusNext();
 }
 async function _focusDecide(verdict) {
   const item = _focusList[_focusIdx]; if (!item) return;
-  await _focusPatch(item.id, { desc_append: '`decision` ' + _ownerName() + ' ' + verdict.toUpperCase() + ' ' + new Date().toISOString().slice(0,10) });
-  if (item.session) { try { await _focusSend(item.session, '[' + _ownerName() + ' decision on ' + item.id + '] ' + verdict.toUpperCase() + ' — proceed accordingly.'); } catch(e) {} }
-  await _focusResolveTag(item);
-  showToast(item.id + ' ' + verdict);
+  if (!await _answerAsk(item, verdict)) return;
   _focusRebuild(); if (_focusIdx >= _focusList.length) _focusIdx = _focusList.length - 1;
   _focusNext();
 }
@@ -31280,7 +31305,13 @@ function _bdRenderMeta(item) {
       + (item.ask_question ? '<div class="board-detail-meta-row"><span style="color:var(--dim)">Question:</span> '
           + _linkifyUrls(esc(String(item.ask_question))) + '</div>' : '')
       + (item.ask_unblocks ? '<div class="board-detail-meta-row"><span style="color:var(--dim)">Unblocks when:</span> '
-          + esc(String(item.ask_unblocks)) + '</div>' : '') + '</section>';
+          + esc(String(item.ask_unblocks)) + '</div>' : '')
+      + (_statusCanon(item.status) === 'needsyou'
+          ? '<div class="board-detail-meta-row bd-ask-actions" style="display:flex;gap:8px;flex-wrap:wrap;margin-top:6px">'
+            + '<button class="btn primary" onclick="_bdAnswer(\'' + escJs(item.id) + '\',\'approved\')">Approve</button>'
+            + '<button class="btn" onclick="_bdAnswer(\'' + escJs(item.id) + '\',\'rejected\')">Reject</button>'
+            + '<button class="btn" onclick="_bdAnswer(\'' + escJs(item.id) + '\',\'answered\')">Answer\u2026</button></div>'
+          : '') + '</section>';
   }
 
   let relationHtml = '';

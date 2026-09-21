@@ -443,6 +443,10 @@ jobs:
         run: |
           set -uo pipefail
           bash scripts/test-hook-report-tmux-derivation.sh
+      - name: the CLI names the configured owner, never a baked-in person (GC3-7)
+        run: |
+          set -uo pipefail
+          bash scripts/test-cli-owner-name.sh
       - name: Playwright MCP binds localhost unless a host is given
         run: |
           set -uo pipefail

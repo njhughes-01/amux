@@ -502,13 +502,15 @@ fn quiet_h() -> f64 {
 /// the detector that exists because THIS repo's deploy was red for three days
 /// must watch this repo without anyone opting in (ethos rule 1 — an extension
 /// point nobody is enrolled in is decoration).
+/// Repos whose GitHub CI autofix polls. OFF unless the owner names them:
+/// empty (or `off`) means no GitHub calls at all. This defaulted to upstream's
+/// repo, so a fork with the setting unset polled a project it does not own,
+/// spending the owner's API rate on someone else's CI.
 fn ci_repos() -> Vec<String> {
-    let raw = env_str("AMUX_CI_REPOS");
-    let raw = if raw.is_empty() {
-        "mixpeek/amux".to_string()
-    } else {
-        raw
-    };
+    parse_ci_repos(&env_str("AMUX_CI_REPOS"))
+}
+
+fn parse_ci_repos(raw: &str) -> Vec<String> {
     raw.split(',')
         .map(|s| s.trim().to_string())
         .filter(|s| s.contains('/'))
@@ -3445,6 +3447,25 @@ pub fn detect_silent(
                     .is_some_and(crate::api::session_verbs::reason_is_reapable);
                 // (reason, seconds since the drain loop last evaluated this lane)
                 let skip = skips.get(&session).cloned();
+                // PAUSED IS THE OWNER'S OWN DECISION (LC-50). An on-demand
+                // worker is paused until someone needs it; its queue delivers
+                // on resume, and no lane has the lever (workers may not resume a
+                // lane). Filing put an unactionable blocker on the sender right
+                // after the owner paused the lane. Recorded, not filed; the queue
+                // stays listed in /api/debug/steering.
+                if block.as_deref() == Some("paused") {
+                    suppressed.push(sup(
+                        DetectorKind::SilentSubsystem,
+                        &format!("silent|steering|{session}"),
+                        &format!(
+                            "{n} message(s) queued {:.0} min for {session}, held because the owner PAUSED the lane. \
+                             NOT filed: pausing is the owner's decision, the queue delivers when the lane is resumed, \
+                             and no lane can resume a worker.",
+                            age / 60.0
+                        ),
+                    ));
+                    continue;
+                }
                 // RATE-LIMITED IS DELIBERATELY UNTOUCHED HERE. AMUX-3815 already
                 // split it correctly a few lines below: a known FUTURE reset
                 // suppresses, and a reset that has passed — or a cap with no
@@ -9799,6 +9820,37 @@ mod tests {
     /// without a human, so it must keep the claim. A change that deleted the
     /// sentence outright would pass the first assertion and remove the warning
     /// from the one state that earns it.
+    /// Unset means OFF, never upstream's repo: a fork that names nothing must
+    /// make no GitHub CI calls.
+    #[test]
+    fn ci_polling_is_off_unless_repos_are_named() {
+        assert!(parse_ci_repos("").is_empty());
+        assert!(parse_ci_repos("off").is_empty());
+        assert_eq!(parse_ci_repos(" owner/a, owner/b "), vec!["owner/a", "owner/b"]);
+    }
+
+    /// LC-50. A paused lane holds its queue on purpose; that is not a card for
+    /// the sender, at any age. Archived stays the control that still files.
+    #[tokio::test]
+    async fn a_paused_lanes_queue_is_recorded_not_filed() {
+        std::env::remove_var("AMUX_STEERING_ROLLUP_AT");
+        let (st, _d) = state();
+        let now = unix_now();
+        seed_queues(&st, now, &["parked-lane", "gone-lane"], 4000.0).await;
+        let mut blocked = BTreeMap::new();
+        blocked.insert("parked-lane".to_string(), Some("paused".to_string()));
+        blocked.insert("gone-lane".to_string(), Some("archived".to_string()));
+        let resets: BTreeMap<String, i64> =
+            ["parked-lane", "gone-lane"].iter().map(|l| (l.to_string(), 0)).collect();
+        let conn = st.store.read().unwrap();
+        let (f, sup) = detect_silent(&conn, now, &blocked, &resets, &BTreeMap::new(), &no_skips());
+        assert!(!f.iter().any(|x| x.signature == "silent|steering|parked-lane"), "{f:?}");
+        let held = sup.iter().find(|x| x.signature == "silent|steering|parked-lane")
+            .expect("declining to file must be a recorded decision");
+        assert!(held.reason.contains("PAUSED"), "{}", held.reason);
+        assert!(f.iter().any(|x| x.signature == "silent|steering|gone-lane"), "archived still files: {f:?}");
+    }
+
     #[tokio::test]
     async fn not_running_does_not_claim_the_queue_will_never_drain_but_archived_does() {
         std::env::remove_var("AMUX_STEERING_ROLLUP_AT");

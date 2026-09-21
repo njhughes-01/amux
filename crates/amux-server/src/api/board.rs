@@ -96,6 +96,7 @@ pub fn routes() -> Router<AppState> {
         // most expensive shape available.
         .route("/{id}/status-request", post(status_request))
         .route("/{id}/status-update", post(status_update))
+        .route("/{id}/answer", post(answer_ask))
         // AMUX-3131: the claim the assignment notifications tell every session to
         // run. It was never mounted, so `amux board claim <id>` hit the GET-only
         // SPA catch-all (405) and the CLI (pre-fix) exited 0 with the card
@@ -13870,6 +13871,158 @@ async fn status_request(
         )
             .into_response(),
     }
+}
+
+/// Tags that park a card on the human. Resolving the ask removes them, or the
+/// dashboard's needs-you view keeps showing a card the owner already answered.
+fn is_needs_human_tag(tag: &str, owner_marker: Option<&str>) -> bool {
+    let t = tag.trim().to_ascii_lowercase();
+    matches!(t.as_str(), "needs:you" | "needs:human" | "needs:owner" | "blocked:human"
+        | "human-gated" | "awaiting-decision" | "awaiting-owner")
+        || owner_marker.is_some_and(|m| t == format!("needs:{m}") || t == format!("awaiting-{m}"))
+}
+
+/// The owner's answer to a needs-you card: approve, reject, or a typed reply
+/// (LC-29).
+///
+/// The dashboard used to append a note, remove tags and send the worker a
+/// message from the browser. The card's STATUS stayed `needsyou`, so an
+/// answered card came straight back in Focus and nothing moved unless the
+/// worker happened to act on a best-effort message. This does all of it on the
+/// server: the transition back to the worker's `todo` (so board pickup hands it
+/// out again), the answer on the card's log under the owner's name, the ask
+/// cleared, and the answer delivered through the durable automated path, whose
+/// outcome is logged on the card too.
+///
+/// Workers ask; they do not answer. A request carrying a worker identity is
+/// refused, so no lane can approve its own ask.
+async fn answer_ask(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+    body: Option<Json<Value>>,
+) -> Response {
+    let worker = crate::api::groups::hdr_worker(&headers);
+    if !worker.is_empty() {
+        tracing::warn!(card = %id, worker = %worker, verdict = "answer_refused_worker", "a worker tried to answer a needs-you card");
+        return err(StatusCode::FORBIDDEN, json!({
+            "error": "only the owner answers a needs-you card; workers ask, they do not answer",
+            "code": "answer_requires_owner",
+        }));
+    }
+    let body = body.map(|Json(v)| v).unwrap_or(Value::Null);
+    let verdict = body.get("verdict").and_then(Value::as_str).unwrap_or("").trim().to_ascii_lowercase();
+    let text = body.get("text").and_then(Value::as_str).unwrap_or("").trim().to_string();
+    let label = match verdict.as_str() {
+        "approved" => "APPROVED",
+        "rejected" => "REJECTED",
+        "answered" => "ANSWERED",
+        _ => return err(StatusCode::BAD_REQUEST, json!({
+            "error": "verdict must be approved, rejected or answered",
+            "hint": "POST {\"verdict\":\"answered\",\"text\":\"...\"}",
+        })),
+    };
+    if verdict == "answered" && text.is_empty() {
+        return err(StatusCode::BAD_REQUEST, json!({"error": "an answer needs text"}));
+    }
+    let home = crate::config::amux_home();
+    let owner = super::org::local_member_actor(&headers)
+        .map(str::to_string)
+        .unwrap_or_else(|| super::settings::owner_name(&home));
+    let marker = super::settings::owner_marker_word(&owner);
+
+    enum Out { Missing, NotAsking(String), Refused(String), Done { session: Option<String>, title: String, question: Option<String> } }
+    let out = std::sync::Arc::new(std::sync::Mutex::new(Out::Missing));
+    let out_w = out.clone();
+    let (id_w, owner_w, text_w) = (id.clone(), owner.clone(), text.clone());
+    let wrote = state.store.write_async(move |conn| {
+        let Some(before) = bs::get_issue(conn, &id_w)? else {
+            return Ok(crate::db::WriteOutcome { applied: false, events: vec![] });
+        };
+        if before.status != "needsyou" {
+            *out_w.lock().unwrap() = Out::NotAsking(before.status);
+            return Ok(crate::db::WriteOutcome { applied: false, events: vec![] });
+        }
+        // Transition first: a refused move writes nothing, so the card is
+        // never left half-answered.
+        let opts = crate::db::advance::AdvanceOpts {
+            expected_from: Some("needsyou".into()),
+            skip_todo_wip: true,
+            log_line: Some(format!("{owner_w} answered the ask ({label}); back to the worker's queue")),
+            ..Default::default()
+        };
+        let events = match crate::db::advance::advance(conn, &id_w, "todo", &owner_w, &opts)? {
+            Ok(o) => o.events,
+            Err(why) => {
+                *out_w.lock().unwrap() = Out::Refused(format!("{why:?}"));
+                return Ok(crate::db::WriteOutcome { applied: false, events: vec![] });
+            }
+        };
+        let mut row = bs::get_issue(conn, &id_w)?.expect("card vanished inside its own transaction");
+        let line = if text_w.is_empty() { format!("`decision` {owner_w} {label}") }
+            else if label == "ANSWERED" { format!("`answered` {owner_w}: {text_w}") }
+            else { format!("`decision` {owner_w} {label}: {text_w}") };
+        row.log = Some(bs::append_log(row.log.as_deref(), &hhmm(), &line));
+        row.tags.retain(|t| !is_needs_human_tag(t, marker.as_deref()));
+        let question = row.ask_question.take();
+        row.ask_type = None;
+        row.ask_unblocks = None;
+        row.ask_actor = None;
+        row.next_action = Some(match (label, text_w.is_empty()) {
+            ("ANSWERED", _) => format!("{owner_w} answered: {text_w} — act on it"),
+            (_, true) => format!("{owner_w} {label} the ask — act on it"),
+            (_, false) => format!("{owner_w} {label} the ask: {text_w} — act on it"),
+        });
+        bs::save_patched(conn, &mut row)?;
+        // Tags live in their own table; save_patched does not write them.
+        bs::set_tags(conn, &row.id, &row.tags, chrono::Utc::now().timestamp())?;
+        *out_w.lock().unwrap() = Out::Done { session: row.session.clone(), title: row.title.clone(), question };
+        Ok(crate::db::WriteOutcome { applied: true, events })
+    }).await;
+    if let Err(e) = wrote {
+        return internal(e);
+    }
+    let (session, title, question) = match std::mem::replace(&mut *out.lock().unwrap(), Out::Missing) {
+        Out::Missing => return not_found(&id),
+        Out::NotAsking(status) => return err(StatusCode::CONFLICT, json!({
+            "error": format!("{id} is not waiting on an answer (status {status})"),
+            "code": "not_needsyou", "status": status,
+        })),
+        Out::Refused(why) => return err(StatusCode::CONFLICT, json!({
+            "error": format!("{id} could not return to the worker's queue"), "why": why,
+        })),
+        Out::Done { session, title, question } => (session, title, question),
+    };
+    tracing::info!(card = %id, owner = %owner, verdict = %label.to_ascii_lowercase(), "board_answer_recorded");
+
+    // Deliver after the commit: the card already says what was decided, so a
+    // failed delivery loses nothing — board pickup hands the todo card out again.
+    let delivery = match session.as_deref().filter(|s| !s.trim().is_empty()) {
+        None => json!({"attempted": false, "why": "the card has no owning worker"}),
+        Some(lane) => {
+            let mut msg = format!("[{owner} {label} {id}] {title}\n");
+            if let Some(q) = &question { msg.push_str(&format!("Question: {q}\n")); }
+            if !text.is_empty() { msg.push_str(&format!("Answer: {text}\n")); }
+            msg.push_str(&format!("The card is back in todo on your board. Claim it (amux board doing {id}) and carry out this decision."));
+            if label == "REJECTED" { msg.push_str(" Rejected: do not proceed with what you asked; follow the answer, or ask again with a different proposal."); }
+            let d = crate::api::session_verbs::deliver_automated(&state, lane, &msg, &format!("board-answer:{id}")).await;
+            let note = if d.refused { format!("answer NOT delivered to {lane}: {}", d.message) }
+                else { format!("answer delivered to {lane}: {} ({})", d.submission, d.message) };
+            let (id_d, note_d) = (id.clone(), note.clone());
+            let _ = state.store.write_async(move |conn| {
+                if let Some(mut row) = bs::get_issue(conn, &id_d)? {
+                    row.log = Some(bs::append_log(row.log.as_deref(), &hhmm(), &note_d));
+                    bs::save_patched(conn, &mut row)?;
+                }
+                Ok(crate::db::WriteOutcome { applied: true, events: vec![] })
+            }).await;
+            if d.refused {
+                tracing::warn!(card = %id, lane = %lane, reason = %d.message, verdict = "board_answer_undelivered", "answer recorded but not delivered; pickup will hand the card out");
+            }
+            json!({"attempted": true, "lane": lane, "refused": d.refused, "submission": d.submission, "message": d.message, "queue_id": d.queue_id})
+        }
+    };
+    Json(json!({"ok": true, "id": id, "verdict": verdict, "status": "todo", "owner": owner, "delivery": delivery})).into_response()
 }
 
 async fn status_update(

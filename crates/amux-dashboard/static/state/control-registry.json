@@ -1,7 +1,13 @@
 {
   "measured": true,
-  "n_considered": 2031,
+  "n_considered": 2033,
   "command_handlers": {
+    "_answerAsk": {
+      "kind": "command._answerAsk",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
     "_applyEmbedView": {
       "kind": "command._applyEmbedView",
       "feedback_required": true,
@@ -64,6 +70,12 @@
     },
     "_atInsert": {
       "kind": "command._atInsert",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_bdAnswer": {
+      "kind": "command._bdAnswer",
       "feedback_required": true,
       "target": "control-or-request",
       "queue_policy": "transport-declared"
