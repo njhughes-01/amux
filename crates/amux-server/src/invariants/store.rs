@@ -53,7 +53,24 @@ pub async fn record(store: &SharedStore, results: Vec<InvariantResult>, duration
         .write_async(move |conn| {
             let ts = now();
             for r in &results {
-                conn.execute(
+                // The incident table preserves repeated observations. The evaluation
+                // log is only a verdict-change timeline, not a per-sweep heartbeat.
+                let unchanged: bool = conn.query_row(
+                    "SELECT EXISTS(
+                         SELECT 1 FROM (
+                             SELECT status, expected, observed, evidence
+                             FROM _amux_invariant_result
+                             WHERE invariant_id=?1 AND entity_key=?2
+                             ORDER BY ts DESC, rowid DESC
+                             LIMIT 1
+                         ) AS previous
+                         WHERE previous.status=?3 AND previous.expected=?4
+                           AND previous.observed=?5 AND previous.evidence=?6
+                     )",
+                    rusqlite::params![r.invariant_id, r.entity_key, r.status.as_str(), r.expected, r.observed, r.evidence.to_string()],
+                    |row| row.get(0),
+                )?;
+                if !unchanged { conn.execute(
                     // Stamp the loaded process image on every row. Replacing
                     // the file on disk does not change the code executing this
                     // pass; build_hash caches startup identity until exec.
@@ -71,7 +88,7 @@ pub async fn record(store: &SharedStore, results: Vec<InvariantResult>, duration
                         duration_ms,
                         crate::build_hash(),
                     ],
-                )?;
+                )?; }
 
                 if r.status.opens_incident() {
                     // UPSERT: one incident per (invariant, entity), forever.
@@ -166,7 +183,7 @@ pub async fn record(store: &SharedStore, results: Vec<InvariantResult>, duration
             let _ = conn.execute(
                 "DELETE FROM _amux_invariant_result WHERE rowid IN (
                     SELECT rowid FROM _amux_invariant_result
-                     WHERE ts < ?2 AND (status = 'pass' OR ts < ?1)
+                     WHERE ts < ?2 AND (status IN ('pass', 'unknown') OR ts < ?1)
                      LIMIT ?3)",
                 rusqlite::params![
                     ts - RESULT_RETAIN_SECS,
@@ -525,6 +542,14 @@ mod tests {
         let inc = live_incidents(&s).unwrap();
         assert_eq!(inc.len(), 1, "100 identical failures must be ONE incident");
         assert_eq!(inc[0]["occurrences"], 100);
+        assert_eq!(result_log_stats(&s).unwrap().0, 1, "identical verdicts are one log row");
+
+        // Only the immediately preceding verdict is suppressible.  A value
+        // that changes and later reverts is a meaningful transition, not the
+        // same old observation resurfacing.
+        record(&s, vec![InvariantResult::fail("x.check", "a", "c").entity("w1")], 1).await;
+        record(&s, vec![InvariantResult::fail("x.check", "a", "b").entity("w1")], 1).await;
+        assert_eq!(result_log_stats(&s).unwrap().0, 3, "a reverted verdict must be recorded");
     }
 
     /// Two entities failing the same check are two incidents — collapsing them
@@ -576,7 +601,7 @@ mod tests {
         let old = now() - 7200.0;
         let _ = s
             .write_async(move |conn| {
-                for (st, id) in [("pass", "old.pass"), ("fail", "old.fail")] {
+        for (st, id) in [("pass", "old.pass"), ("unknown", "old.unknown"), ("fail", "old.fail")] {
                     conn.execute(
                         "INSERT INTO _amux_invariant_result
                            (ts, invariant_id, status, entity_key, expected, observed, evidence, duration_ms)
@@ -602,7 +627,7 @@ mod tests {
         assert_eq!(
             left,
             vec!["fresh.check".to_string(), "old.fail".to_string()],
-            "stale pass gone, stale fail kept, fresh row kept"
+            "stale pass and unknown gone, stale fail kept, fresh row kept"
         );
 
         let (rows, oldest) = result_log_stats(&s).unwrap();
