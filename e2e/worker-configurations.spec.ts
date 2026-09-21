@@ -102,11 +102,26 @@ test('worker Configurations edits the full board lifecycle and every scoped capa
     // told users to edit the other five "where they live".
     const tiles = panel.locator('.scope-tile');
     await expect(tiles).toHaveCount(7);
+    // A tile click flips `_scopeRowOpen` at once but re-renders only after a
+    // fetch; a click that lands while another render replaces the tile is
+    // lost (ios-safari, CI). Click until the dashboard's own flag says the row
+    // is in the wanted state, never twice once it is, then wait for the render.
+    const editAtLevel = panel.getByRole('button', { name: /^Edit .+ at this level$/ });
+    const setTile = async (i: number, open: boolean) => {
+      const key = await tiles.nth(i).evaluate(
+        (el) => /_scopeRowToggle\('([^']+)'\)/.exec(el.getAttribute('onclick') || '')?.[1] || '');
+      expect(key, 'scope tile must name its row').toBeTruthy();
+      const isOpen = () => page.evaluate((k) => !!(eval('_scopeRowOpen') as Record<string, boolean>)[k], key);
+      await expect(async () => {
+        if ((await isOpen()) !== open) await tiles.nth(i).click({ timeout: 2_000 });
+        expect(await isOpen()).toBe(open);
+      }).toPass({ timeout: 15_000 });
+    };
     for (let i = 0; i < 7; i += 1) {
-      await tiles.nth(i).click();
-      await expect(panel.getByRole('button', { name: /^Edit .+ at this level$/ })).toBeVisible();
-      await tiles.nth(i).click();
-      await expect(panel.getByRole('button', { name: /^Edit .+ at this level$/ })).toHaveCount(0);
+      await setTile(i, true);
+      await expect(editAtLevel).toBeVisible();
+      await setTile(i, false);
+      await expect(editAtLevel).toHaveCount(0);
     }
 
     // Default path: both queue transitions are on for every worker without a

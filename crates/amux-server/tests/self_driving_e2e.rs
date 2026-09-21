@@ -550,8 +550,7 @@ async fn workers_create_only_on_their_own_board_and_link_peers_explicitly() {
             "status": "backlog",
             "type": "chore",
             "reviewer": "worker-b",
-            "shepherd": "worker-c",
-            "depends_on": [dependency_id]
+            "shepherd": "worker-c"
         })),
         &[("x-amux-worker", "worker-a")],
     )
@@ -560,12 +559,31 @@ async fn workers_create_only_on_their_own_board_and_link_peers_explicitly() {
     assert_eq!(own["session"], "worker-a");
     assert_eq!(own["reviewer"], "worker-b");
     assert_eq!(own["shepherd"], "worker-c");
-    assert_eq!(own["depends_on"], json!([dependency_id]));
+
+    // Boards are self-contained: a peer's card is evidence, not a scheduler
+    // dependency, so depending on it is refused and nothing is minted.
+    let (status, _, foreign) = send(
+        &rig.app,
+        "POST",
+        "/api/board",
+        Some(json!({
+            "title": "Own work waiting on a peer card",
+            "session": "worker-a",
+            "status": "backlog",
+            "type": "chore",
+            "depends_on": [dependency_id]
+        })),
+        &[("x-amux-worker", "worker-a")],
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{foreign}");
+    assert_eq!(foreign["code"], "cross_board_dependency_forbidden");
 
     let (_, _, all) = send(&rig.app, "GET", "/api/board?all=1", None, &[]).await;
     assert!(!all.as_array().unwrap().iter().any(|row| {
         row["title"] == "Illegally placed peer work" && row["session"] == "worker-b"
     }));
+    assert!(!all.as_array().unwrap().iter().any(|row| row["title"] == "Own work waiting on a peer card"));
 }
 
 fn fixture_script(dir: &Path, long_line: &str) -> PathBuf {

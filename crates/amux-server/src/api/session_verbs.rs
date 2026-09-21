@@ -6249,8 +6249,33 @@ async fn pane_has_live_child(name: &str) -> Option<bool> {
     if pid.is_empty() {
         return None;
     }
-    let ch = run_cmd("pgrep", &["-P", &pid], OP_TIMEOUT).await?;
-    Some(!ch.stdout.iter().all(|b| b.is_ascii_whitespace()))
+    // `pgrep -P` counts zombies. Stop SIGSTOPs a job before killing it, so a
+    // job-control shell marks it Stopped, returns to its prompt and reaps the
+    // corpse only lazily: a stopped worker then read as still running.
+    let ps = run_cmd("ps", &["-axo", "pid=,ppid=,stat="], OP_TIMEOUT).await?;
+    if !ps.status.success() {
+        return None;
+    }
+    let (live, zombies) = count_children(&String::from_utf8_lossy(&ps.stdout), pid.parse().ok()?);
+    if zombies > 0 && live == 0 {
+        tracing::debug!(session = name, zombies, verdict = "pane_zombie_child_ignored", "pane has only unreaped children; not live");
+    }
+    Some(live > 0)
+}
+
+/// Children of `parent` in `ps -axo pid=,ppid=,stat=` output, as
+/// (live, zombie). A zombie has exited and holds nothing.
+fn count_children(ps: &str, parent: i32) -> (usize, usize) {
+    let mut counts = (0, 0);
+    for line in ps.lines() {
+        let mut w = line.split_whitespace();
+        let (Some(_pid), Some(ppid), Some(stat)) = (w.next(), w.next(), w.next()) else { continue };
+        if ppid.parse::<i32>().ok() != Some(parent) {
+            continue;
+        }
+        if stat.starts_with('Z') { counts.1 += 1 } else { counts.0 += 1 }
+    }
+    counts
 }
 
 fn provider_process_command(provider: &str, claude_cmd: Option<&str>) -> String {
@@ -6273,7 +6298,8 @@ fn pane_process_running(command: &str, provider: &str, has_child: Option<bool>) 
 }
 
 async fn pane_runs_provider(name: &str, provider: &str) -> bool {
-    let Some(out) = tmux(&["display-message", "-p", "-t", &pt(name), "#{pane_current_command}"]).await else {
+    let pt = pt(name);
+    let Some(out) = tmux(&["display-message", "-p", "-t", &pt, "#{pane_current_command}"]).await else {
         return false;
     };
     out.status.success() && pane_process_running(&String::from_utf8_lossy(&out.stdout), provider, Some(false))
@@ -10376,8 +10402,8 @@ pub(crate) async fn stop_for_pause(state: &AppState, name: &str) -> anyhow::Resu
         let (ok, detail) = stop_session_process(name).await;
         anyhow::ensure!(ok, "{detail}");
     } else {
-        let pane_target = pt(name);
-        let pane = tmux(&["list-panes", "-t", &pane_target, "-F", "#{pane_pid}"]).await;
+        let pt = pt(name);
+        let pane = tmux(&["list-panes", "-t", &pt, "-F", "#{pane_pid}"]).await;
         if let Some(out) = pane.filter(|o| o.status.success()) {
             for line in String::from_utf8_lossy(&out.stdout).lines() {
                 let root: i32 = line.trim().parse()?;
@@ -22183,7 +22209,8 @@ mod tests {
         struct Pane(String);
         impl Drop for Pane {
             fn drop(&mut self) {
-                let _ = std::process::Command::new("tmux").args(["kill-session", "-t", &session_target(&self.0)]).output();
+                let st = session_target(&self.0);
+                let _ = std::process::Command::new("tmux").args(["kill-session", "-t", &st]).output();
             }
         }
         for (kind, command, expected) in [
@@ -27590,6 +27617,14 @@ CLAUDE-POSTFIX-COMPLETE
         pane.kill().await.unwrap(); peer.kill().await.unwrap();
     }
 
+    #[test]
+    fn a_zombie_child_is_not_a_live_child() {
+        let ps = "  100     1 Ss\n  200   100 S+\n  201   100 Z\n  300   999 R\n";
+        assert_eq!(count_children(ps, 100), (1, 1));
+        assert_eq!(count_children("  201   100 Z\n", 100), (0, 1), "only a corpse left: not live");
+        assert_eq!(count_children(ps, 42), (0, 0));
+    }
+
     #[tokio::test]
     async fn stop_route_interrupts_busy_tools_without_waiting_for_composer_commands() {
         let home = tempfile::tempdir().unwrap();
@@ -27600,13 +27635,15 @@ CLAUDE-POSTFIX-COMPLETE
         struct Pane(String);
         impl Drop for Pane {
             fn drop(&mut self) {
-                let _ = std::process::Command::new("tmux").args(["kill-session", "-t", &session_target(&self.0)]).output();
+                let st = session_target(&self.0);
+                let _ = std::process::Command::new("tmux").args(["kill-session", "-t", &st]).output();
             }
         }
         let pane = Pane(tmux_name(&name));
         let created = tmux(&["new-session", "-d", "-s", &pane.0, "/bin/sh"]).await.expect("tmux required for stop-route proof");
         assert!(created.status.success(), "{}", String::from_utf8_lossy(&created.stderr));
-        let typed = tmux(&["send-keys", "-t", &pt(&name), "/bin/sh -c 'sleep 120 & wait'", "Enter"]).await.unwrap();
+        let pt = pt(&name);
+        let typed = tmux(&["send-keys", "-t", &pt, "/bin/sh -c 'sleep 120 & wait'", "Enter"]).await.unwrap();
         assert!(typed.status.success(), "{}", String::from_utf8_lossy(&typed.stderr));
         sleep_ms(150).await;
         assert_eq!(pane_has_live_child(&name).await, Some(true), "busy-tool fixture must be running");
