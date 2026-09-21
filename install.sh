@@ -186,6 +186,11 @@ EOF
     printf 'jobs = %s\n' "$AMUX_CARGO_JOBS" >> "$SCRIPT_DIR/.cargo/config.toml"
     say "cargo config: jobs capped at $AMUX_CARGO_JOBS (AMUX_CARGO_JOBS set)"
   fi
+  # Tests `git init` throwaway repos. A user's global init.templatedir would
+  # copy its hooks (e.g. a commit-message hook) into them and reject the
+  # tests' own commits. Empty = no template. Appended LAST: a later
+  # `jobs = N` line would otherwise land under [env] instead of [build].
+  printf '\n[env]\nGIT_TEMPLATE_DIR = ""\n' >> "$SCRIPT_DIR/.cargo/config.toml"
   say "cargo config: builds in this checkout target $SHARED_TARGET_DIR"
 fi
 

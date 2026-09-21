@@ -22,6 +22,10 @@
 #
 # Exit status is the test command's, untouched — this reports, it never decides.
 set -uo pipefail
+# Hermetic git for the tests this runs: a user's global init.templatedir would
+# copy its hooks into the throwaway repos tests create and reject their commits
+# (9 amux-server tests failed on a box with a commit-message hook template).
+export GIT_TEMPLATE_DIR=
 
 # RUN FROM A SNAPSHOT OF THIS FILE (AF-368, found by `amux`).
 #
