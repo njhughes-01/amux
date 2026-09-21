@@ -28,6 +28,7 @@
 # it concludes — not whether cargo works. The cost of a real build (~22s, and it
 # does not amortise) is measured on the card, not re-measured per cell.
 set -euo pipefail
+export GIT_TEMPLATE_DIR=   # a global init.templatedir must not reach the repos this makes
 cd "$(dirname "$0")/.."
 ROOT_REPO="$(pwd)"
 PASS=0; FAIL=0

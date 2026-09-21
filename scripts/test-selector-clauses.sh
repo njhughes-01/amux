@@ -24,6 +24,7 @@
 # the AF-564 lesson: a cell whose precondition is environmental cannot fail on
 # the machine that ships it.
 set -eu
+export GIT_TEMPLATE_DIR=   # a global init.templatedir must not reach the repos this makes
 SRC="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 PASS=0; FAIL=0
 ok()  { if [ "$2" = "$3" ]; then PASS=$((PASS+1)); echo "  ok   $1"; else

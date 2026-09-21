@@ -25,6 +25,7 @@
 # it FAILS on the same fixture. Confirmed before wiring in: with B's mutation
 # applied to the shipped script, A fails and B passes.
 set -euo pipefail
+export GIT_TEMPLATE_DIR=   # a global init.templatedir must not reach the repos this makes
 
 SRC_REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
 TMP="$(mktemp -d)"

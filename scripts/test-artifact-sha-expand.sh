@@ -10,6 +10,7 @@
 # dashboard renderer was never the defect: it already links a URL and opens a
 # path. The REF was not a thing you could open.
 set -euo pipefail
+export GIT_TEMPLATE_DIR=   # a global init.templatedir must not reach the repos this makes
 cd "$(dirname "$0")/.."
 CLI="${AMUX_CLI:-$(pwd)/amux}"
 PASS=0; FAIL=0

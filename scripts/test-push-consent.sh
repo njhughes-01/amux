@@ -18,6 +18,7 @@
 #     scripts/test-push-consent.sh: line 103: check_not: command not found
 # then exit 127. No verdict is printed, so there is no false PASS.
 set -euo pipefail
+export GIT_TEMPLATE_DIR=   # a global init.templatedir must not reach the repos this makes
 cd "$(dirname "$0")/.."
 
 BASE=c6876cf1

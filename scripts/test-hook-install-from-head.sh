@@ -18,6 +18,7 @@
 # test to write. The cell below dirties the file first, which is the state both
 # incidents were in.
 set -uo pipefail
+export GIT_TEMPLATE_DIR=   # a global init.templatedir must not reach the repos this makes
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
 pass=0; fail=0
