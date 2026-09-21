@@ -3,7 +3,7 @@
 # AMUX_OWNER_NAME in the environment, then ~/.amux/server.env, then
 # `git config --global user.name`, then the login. Only the function is
 # extracted, in a throwaway HOME, so nothing on this machine is read.
-set -uo pipefail
+set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 fn="$(sed -n '/^_owner_name() {/,/^}/p' "$ROOT/amux")"
 [ -n "$fn" ] || { echo "FAIL _owner_name not found in amux"; exit 1; }
