@@ -502,13 +502,15 @@ fn quiet_h() -> f64 {
 /// the detector that exists because THIS repo's deploy was red for three days
 /// must watch this repo without anyone opting in (ethos rule 1 — an extension
 /// point nobody is enrolled in is decoration).
+/// Repos whose GitHub CI autofix polls. OFF unless the owner names them:
+/// empty (or `off`) means no GitHub calls at all. This defaulted to upstream's
+/// repo, so a fork with the setting unset polled a project it does not own,
+/// spending the owner's API rate on someone else's CI.
 fn ci_repos() -> Vec<String> {
-    let raw = env_str("AMUX_CI_REPOS");
-    let raw = if raw.is_empty() {
-        "mixpeek/amux".to_string()
-    } else {
-        raw
-    };
+    parse_ci_repos(&env_str("AMUX_CI_REPOS"))
+}
+
+fn parse_ci_repos(raw: &str) -> Vec<String> {
     raw.split(',')
         .map(|s| s.trim().to_string())
         .filter(|s| s.contains('/'))
@@ -9818,6 +9820,15 @@ mod tests {
     /// without a human, so it must keep the claim. A change that deleted the
     /// sentence outright would pass the first assertion and remove the warning
     /// from the one state that earns it.
+    /// Unset means OFF, never upstream's repo: a fork that names nothing must
+    /// make no GitHub CI calls.
+    #[test]
+    fn ci_polling_is_off_unless_repos_are_named() {
+        assert!(parse_ci_repos("").is_empty());
+        assert!(parse_ci_repos("off").is_empty());
+        assert_eq!(parse_ci_repos(" owner/a, owner/b "), vec!["owner/a", "owner/b"]);
+    }
+
     /// LC-50. A paused lane holds its queue on purpose; that is not a card for
     /// the sender, at any age. Archived stays the control that still files.
     #[tokio::test]
