@@ -29,6 +29,7 @@
 #
 # Exit 0 = all pass, 1 = a failure.
 set -euo pipefail
+export GIT_TEMPLATE_DIR=   # a global init.templatedir must not reach the repos this makes
 cd "$(dirname "$0")/.."
 GUARD="${PUSH_GUARD_HOOK:-$(pwd)/scripts/git-hooks/append-only-push-guard}"
 PASS=0; FAIL=0

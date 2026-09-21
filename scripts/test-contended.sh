@@ -22,10 +22,6 @@
 #
 # Exit status is the test command's, untouched — this reports, it never decides.
 set -uo pipefail
-# Hermetic git for the tests this runs: a user's global init.templatedir would
-# copy its hooks into the throwaway repos tests create and reject their commits
-# (9 amux-server tests failed on a box with a commit-message hook template).
-export GIT_TEMPLATE_DIR=
 
 # RUN FROM A SNAPSHOT OF THIS FILE (AF-368, found by `amux`).
 #
@@ -68,6 +64,11 @@ if [ -z "${_TC_SNAPSHOT:-}" ]; then
   export _TC_ORIGIN="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")"
   exec bash "$_snap" "$@"
 fi
+
+# Hermetic git for the tests this runs: a user's global init.templatedir would
+# copy its hooks into the throwaway repos tests create and reject their commits
+# (9 amux-server tests failed on a box with a commit-message hook template).
+export GIT_TEMPLATE_DIR=
 
 LOCK="${AMUX_RS_BUILD_LOCK:-$HOME/.amux/rust-build.lock}"
 : "${CARGO_TARGET_DIR:=$HOME/.amux/rust-build-target}"

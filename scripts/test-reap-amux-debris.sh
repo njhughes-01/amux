@@ -7,6 +7,7 @@
 # --apply. Each cell below fails if its guard is removed — the point of the test
 # is that it can go red, not that it is green today (ethos rule 7).
 set -euo pipefail
+export GIT_TEMPLATE_DIR=   # a global init.templatedir must not reach the repos this makes
 HERE=$(cd "$(dirname "$0")" && pwd)
 REAPER="$HERE/reap-amux-debris.sh"
 FIX=$(mktemp -d)                     # never a fixed name: /tmp is shared by every lane

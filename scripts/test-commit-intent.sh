@@ -12,6 +12,7 @@
 # `set -e` is the guard against a cell that never ran (AF-561's ratchet applies to
 # this file as much as to any other).
 set -euo pipefail
+export GIT_TEMPLATE_DIR=   # a global init.templatedir must not reach the repos this makes
 cd "$(dirname "$0")/.."
 
 HOOKS="$(pwd)/scripts/git-hooks"

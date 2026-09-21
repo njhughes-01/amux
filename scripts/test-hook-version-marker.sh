@@ -16,6 +16,7 @@
 # STALE. Without it this suite would pass with the numeric check deleted, since
 # a stale copy usually lacks tokens too.
 set -u
+export GIT_TEMPLATE_DIR=   # a global init.templatedir must not reach the repos this makes
 SRC="$(cd "$(dirname "$0")/.." && pwd)"
 T=$(mktemp -d) || exit 2
 trap 'rm -rf "$T"' EXIT

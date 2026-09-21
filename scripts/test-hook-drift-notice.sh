@@ -18,6 +18,7 @@
 # plus the anti-vacuity control, because a banner nobody can fail is a banner
 # nobody should believe.
 set -euo pipefail
+export GIT_TEMPLATE_DIR=   # a global init.templatedir must not reach the repos this makes
 cd "$(dirname "$0")/.."
 SRC_REPO="$(pwd)"
 PASS=0; FAIL=0
@@ -55,6 +56,7 @@ scratch() {
   local R="$tmp/repo"
   mkdir -p "$R/.claude" "$R/scripts/git-hooks"
   git init -q "$R"
+  mkdir -p "$R/.git/hooks"   # no template means git init creates no hooks dir
   cp "$SRC_REPO/.claude/session-freshness.sh" "$R/.claude/"
   chmod +x "$R/.claude/session-freshness.sh"
   for h in pre-commit pre-push prepare-commit-msg amux-staged-guard; do
