@@ -26,6 +26,10 @@
 #   scripts/safe-cargo.sh check -p amux-server
 #   scripts/safe-cargo.sh clippy -p amux-server --all-targets -- -D warnings
 set -euo pipefail
+# Hermetic git for the tests this runs: a user's global init.templatedir would
+# copy its hooks into the throwaway repos tests create and reject their commits
+# (9 amux-server tests failed on a box with a commit-message hook template).
+export GIT_TEMPLATE_DIR=
 
 # A concurrency slot bounds invocations, not rustc's internal parallelism or
 # libtest's threads. Cargo otherwise defaults to every CPU on the host, per
