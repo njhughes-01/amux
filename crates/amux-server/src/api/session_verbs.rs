@@ -6249,8 +6249,33 @@ async fn pane_has_live_child(name: &str) -> Option<bool> {
     if pid.is_empty() {
         return None;
     }
-    let ch = run_cmd("pgrep", &["-P", &pid], OP_TIMEOUT).await?;
-    Some(!ch.stdout.iter().all(|b| b.is_ascii_whitespace()))
+    // `pgrep -P` counts zombies. Stop SIGSTOPs a job before killing it, so a
+    // job-control shell marks it Stopped, returns to its prompt and reaps the
+    // corpse only lazily: a stopped worker then read as still running.
+    let ps = run_cmd("ps", &["-axo", "pid=,ppid=,stat="], OP_TIMEOUT).await?;
+    if !ps.status.success() {
+        return None;
+    }
+    let (live, zombies) = count_children(&String::from_utf8_lossy(&ps.stdout), pid.parse().ok()?);
+    if zombies > 0 && live == 0 {
+        tracing::debug!(session = name, zombies, verdict = "pane_zombie_child_ignored", "pane has only unreaped children; not live");
+    }
+    Some(live > 0)
+}
+
+/// Children of `parent` in `ps -axo pid=,ppid=,stat=` output, as
+/// (live, zombie). A zombie has exited and holds nothing.
+fn count_children(ps: &str, parent: i32) -> (usize, usize) {
+    let mut counts = (0, 0);
+    for line in ps.lines() {
+        let mut w = line.split_whitespace();
+        let (Some(_pid), Some(ppid), Some(stat)) = (w.next(), w.next(), w.next()) else { continue };
+        if ppid.parse::<i32>().ok() != Some(parent) {
+            continue;
+        }
+        if stat.starts_with('Z') { counts.1 += 1 } else { counts.0 += 1 }
+    }
+    counts
 }
 
 fn provider_process_command(provider: &str, claude_cmd: Option<&str>) -> String {
@@ -27588,6 +27613,14 @@ CLAUDE-POSTFIX-COMPLETE
         assert!(pane.try_wait().unwrap().is_none(), "pane shell must survive");
         assert!(peer.try_wait().unwrap().is_none(), "unrelated worker must survive");
         pane.kill().await.unwrap(); peer.kill().await.unwrap();
+    }
+
+    #[test]
+    fn a_zombie_child_is_not_a_live_child() {
+        let ps = "  100     1 Ss\n  200   100 S+\n  201   100 Z\n  300   999 R\n";
+        assert_eq!(count_children(ps, 100), (1, 1));
+        assert_eq!(count_children("  201   100 Z\n", 100), (0, 1), "only a corpse left: not live");
+        assert_eq!(count_children(ps, 42), (0, 0));
     }
 
     #[tokio::test]
