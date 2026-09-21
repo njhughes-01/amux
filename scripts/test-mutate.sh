@@ -37,6 +37,18 @@ if out=$("$MUT" run "$TMP/f.txt" beta BETA -- true 2>&1); then rc=0; else rc=$?;
 [ "$rc" -eq 0 ] && ok "happy path exits 0" || bad "happy path exit $rc"
 [ "$(cat "$TMP/f.txt")" = "$before" ] && ok "happy path restores the file" || bad "happy path left residue"
 
+# 1b. A command that PRINTS and exits 0 is a surviving mutation with output, and
+# must not be reported as silent. The run log is a mktemp file: GNU mktemp
+# refuses a template without XXXXXX, the log was never created, and every
+# surviving mutation on Linux read as "produced NO OUTPUT".
+fresh
+out=$("$MUT" run "$TMP/f.txt" beta BETA -- echo mutated-run-said-something 2>&1) || true
+case "$out" in
+  *"NO OUTPUT"*) bad "a run that printed was reported as having no output" ;;
+  *mutated-run-said-something*) ok "a run that printed is not reported as silent" ;;
+  *) bad "the command's own output was lost" ;;
+esac
+
 # 2. FAILING COMMAND: the command's exit status is preserved, file restored.
 fresh
 if "$MUT" run "$TMP/f.txt" beta BETA -- sh -c 'exit 7' >/dev/null 2>&1; then rc=0; else rc=$?; fi

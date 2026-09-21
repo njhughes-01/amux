@@ -60,6 +60,11 @@ fn rig() -> Rig {
     std::env::set_var("AMUX_NEEDSYOU_ASK_REQUIRED", "0");
     std::env::set_var("AMUX_TODO_WIP_LIMIT", "0");
     std::env::set_var("AMUX_CONTINUATION_REQUIRED", "0");
+    // The dependency-chain scenario is a cooperative fan-out across boards,
+    // which is the explicit legacy opt-in now that boards are self-contained
+    // by default. The default refusal has its own coverage (board_ownership,
+    // self_driving_e2e).
+    std::env::set_var("AMUX_BOARD_DELEGATION", "1");
     let dir = tempfile::tempdir().unwrap();
     let store: SharedStore = Arc::new(Store::open(&dir.path().join("golden.db")).unwrap());
     let state = AppState {

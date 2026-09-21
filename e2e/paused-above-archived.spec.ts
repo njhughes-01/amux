@@ -12,6 +12,11 @@ test('the Paused accordion renders immediately above the Archived accordion, bel
   ];
   await page.addInitScript(() => localStorage.setItem('amux_walkthrough_done', '1'));
   await page.route(/\/api\/sessions(?:\?.*)?$/, r => r.fulfill({json: workers}));
+  // The live stream would REPLACE `sessions` with the test server's real
+  // (empty) list whenever its first `sessions` event lands, which removed the
+  // Paused footer between the text check and the layout measurement on slow
+  // CI shards. Block it; the dashboard falls back to the mocked polling.
+  await page.route('**/api/events**', r => r.abort());
   await page.goto('/');
   await page.waitForFunction(() => typeof (window as any).render === 'function');
   await page.evaluate(ws => { eval('sessions=' + JSON.stringify(ws) + '; render();'); }, workers);
