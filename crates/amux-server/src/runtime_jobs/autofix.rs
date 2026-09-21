@@ -1322,6 +1322,7 @@ struct P95Hit {
 /// the p95 path was fixed, and that lesson is already written into
 /// `request_log.rs` a few hundred lines away.
 fn p95_finding(h: &P95Hit, mult: f64, min_n: i64, now: f64) -> Finding {
+    let (method, family) = h.fam.split_once(' ').expect("p95 family has method and path");
     Finding {
         kind: DetectorKind::Latency,
         signature: format!("latency|p95|{}", h.fam),
@@ -1391,9 +1392,9 @@ fn p95_finding(h: &P95Hit, mult: f64, min_n: i64, now: f64) -> Finding {
         ],
         recheck: format!(
             "curl -sk \"$AMUX_URL/api/logs/stats?since_h={}\" | python3 -c \"import json,sys; \
-             d=json.load(sys.stdin); print([f for f in d['families'] if f.get('family')=='{}'])\"",
+             d=json.load(sys.stdin); print([f for f in d['families'] if f.get('method')=='{}' and f.get('family')=='{}'])\"",
             window_h() as i64,
-            h.fam
+            method, family
         ),
         owner: None,
         count: h.win_n as u64,
@@ -12097,10 +12098,13 @@ mod tests {
             });
         }
         let (f, _) = detect_latency(&st.store.read().unwrap(), now);
+        let hit = f.iter().find(|x| x.signature == "latency|p95|GET /api/board");
         assert!(
-            f.iter().any(|x| x.signature == "latency|p95|GET /api/board"),
+            hit.is_some(),
             "a real GET regression must remain visible: {f:?}"
         );
+        assert!(hit.unwrap().recheck.contains("f.get('method')=='GET' and f.get('family')=='/api/board'"),
+            "the recheck must use the detector's method-plus-path family");
     }
 
     /// A p95 over four requests is one request wearing a percentile. Both

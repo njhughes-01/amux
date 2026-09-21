@@ -2384,7 +2384,7 @@ struct FamAcc {
     clients: std::collections::BTreeSet<String>,
 }
 
-/// GET /api/logs/stats?since_h=24 — per-family traffic/latency/error rollup
+/// GET /api/logs/stats?since_h=24 — per-method-and-family traffic/latency/error rollup
 /// plus `slow_outliers` (rows > 5x their family's p50, capped 20 overall,
 /// ranked by ratio). Percentiles: nearest-rank over the window's sorted
 /// per-family latencies (see [`percentile_sorted`]); `percentile_method` in
@@ -2402,7 +2402,7 @@ async fn stats(
         Ok(c) => c,
         Err(e) => return internal(e),
     };
-    let mut fams: std::collections::BTreeMap<String, FamAcc> = Default::default();
+    let mut fams: std::collections::BTreeMap<(String, String), FamAcc> = Default::default();
     let mut scanned = 0i64;
     let mut oldest_ts: Option<f64> = None;
     // Restart-spanning rows, excluded from the latency statistics and COUNTED
@@ -2411,7 +2411,7 @@ async fn stats(
     // here is a measurement where silence would not be.
     let proc_boot = crate::runtime_jobs::heartbeat::boot_at();
     let mut spanned = 0u64;
-    let mut spanned_by_family: std::collections::BTreeMap<String, u64> = Default::default();
+    let mut spanned_by_family: std::collections::BTreeMap<(String, String), u64> = Default::default();
 
     // SAMPLE THE WINDOW; DO NOT TRUNCATE IT (AF-261).
     //
@@ -2458,7 +2458,7 @@ async fn stats(
             // actual_window_h truthful by construction.
             // `?3 = 1` makes the modulus a no-op, so the unsampled path is the
             // same statement and the same plan it has always been.
-            "SELECT family, status, latency_ms, answered_by, worker, amux_session, client_ip, ts, \
+            "SELECT method, family, status, latency_ms, answered_by, worker, amux_session, client_ip, ts, \
              boot_at \
              FROM _amux_request_log WHERE ts >= ?1 AND (id % ?3) = 0 \
              ORDER BY ts DESC LIMIT ?2",
@@ -2466,15 +2466,16 @@ async fn stats(
         let mut rows = stmt.query(rusqlite::params![cutoff, ANALYZE_SCAN_CAP, stride])?;
         while let Some(r) = rows.next()? {
             scanned += 1;
-            let family: String = r.get(0)?;
-            let status: i64 = r.get(1)?;
-            let latency_ms: f64 = r.get(2)?;
-            let answered_by: String = r.get(3)?;
-            let worker: Option<String> = r.get(4)?;
-            let amux_session: Option<String> = r.get(5)?;
-            let client_ip: Option<String> = r.get(6)?;
-            let ts: f64 = r.get(7)?;
-            let row_boot: Option<f64> = r.get(8)?;
+            let method: String = r.get(0)?;
+            let family: String = r.get(1)?;
+            let status: i64 = r.get(2)?;
+            let latency_ms: f64 = r.get(3)?;
+            let answered_by: String = r.get(4)?;
+            let worker: Option<String> = r.get(5)?;
+            let amux_session: Option<String> = r.get(6)?;
+            let client_ip: Option<String> = r.get(7)?;
+            let ts: f64 = r.get(8)?;
+            let row_boot: Option<f64> = r.get(9)?;
             // A REQUEST WHOSE CLOCK SPANS A RESTART IS NOT A SLOW REQUEST (AF-186).
             //
             // `latency_ms` is wall time from arrival to completion, so a request
@@ -2492,11 +2493,11 @@ async fn stats(
             if crate::runtime_jobs::autofix::spans_own_restart(ts, latency_ms, row_boot, proc_boot)
             {
                 spanned += 1;
-                *spanned_by_family.entry(family.clone()).or_insert(0u64) += 1;
+                *spanned_by_family.entry((method.clone(), family.clone())).or_insert(0u64) += 1;
                 continue;
             }
             oldest_ts = Some(oldest_ts.map_or(ts, |prev: f64| prev.min(ts)));
-            let f = fams.entry(family).or_insert_with(|| FamAcc {
+            let f = fams.entry((method, family)).or_insert_with(|| FamAcc {
                 latencies: Vec::new(),
                 error_count: 0,
                 proxy_count: 0,
@@ -2531,7 +2532,7 @@ async fn stats(
         return internal(e);
     }
 
-    // Percentiles + the outlier pass. Outlier rows are re-read per family
+    // Percentiles + the outlier pass. Outlier rows are re-read per method and family
     // (indexed on (family, ts)) so the first pass never has to hold whole
     // rows — only latency vectors — in memory.
     let mut fam_rows: Vec<(String, Value, f64)> = Vec::new(); // (family, json, p50)
@@ -2542,7 +2543,7 @@ async fn stats(
     let mut all_workers: std::collections::BTreeSet<String> = Default::default();
     let mut all_clients: std::collections::BTreeSet<String> = Default::default();
     let mut all_origins: std::collections::BTreeMap<String, u64> = Default::default();
-    for (family, mut acc) in fams {
+    for ((method, family), mut acc) in fams {
         acc.latencies.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
         let n = acc.latencies.len();
         let p50 = percentile_sorted(&acc.latencies, 0.50);
@@ -2561,6 +2562,7 @@ async fn stats(
         fam_rows.push((
             family.clone(),
             json!({
+                "method": method,
                 "family": family,
                 "count": n,
                 "p50_ms": round2(p50), "p95_ms": round2(p95), "max_ms": round2(max),
@@ -2569,7 +2571,7 @@ async fn stats(
                 // Zero is the healthy answer and it is PUBLISHED (AF-186/AF-180).
                 // Silence would be indistinguishable from "the exclusion is not
                 // wired in", which is the defect this endpoint had.
-                "restart_spanning_excluded": spanned_by_family.get(&family).copied().unwrap_or(0),
+                "restart_spanning_excluded": spanned_by_family.get(&(method.clone(), family.clone())).copied().unwrap_or(0),
                 "proxy_count": acc.proxy_count,
                 "origins": acc.origins,
                 "distinct_workers": acc.workers.len(),
@@ -2586,11 +2588,11 @@ async fn stats(
                     "SELECT ts, method, path, status, latency_ms, worker, boot_at, \
                             amux_session, client_ip \
                      FROM _amux_request_log \
-                     WHERE family = ?1 AND ts >= ?2 AND latency_ms > ?3 \
-                     ORDER BY latency_ms DESC LIMIT ?4",
+                     WHERE method = ?1 AND family = ?2 AND ts >= ?3 AND latency_ms > ?4 \
+                     ORDER BY latency_ms DESC LIMIT ?5",
                 )?;
                 let mut rows =
-                    stmt.query(rusqlite::params![family, cutoff, threshold, OUTLIER_CAP as i64])?;
+                    stmt.query(rusqlite::params![method, family, cutoff, threshold, OUTLIER_CAP as i64])?;
                 while let Some(r) = rows.next()? {
                     let ts: f64 = r.get(0)?;
                     let method: String = r.get(1)?;
