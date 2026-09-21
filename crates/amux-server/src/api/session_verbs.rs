@@ -6298,7 +6298,8 @@ fn pane_process_running(command: &str, provider: &str, has_child: Option<bool>) 
 }
 
 async fn pane_runs_provider(name: &str, provider: &str) -> bool {
-    let Some(out) = tmux(&["display-message", "-p", "-t", &pt(name), "#{pane_current_command}"]).await else {
+    let pt = pt(name);
+    let Some(out) = tmux(&["display-message", "-p", "-t", &pt, "#{pane_current_command}"]).await else {
         return false;
     };
     out.status.success() && pane_process_running(&String::from_utf8_lossy(&out.stdout), provider, Some(false))
@@ -10401,8 +10402,8 @@ pub(crate) async fn stop_for_pause(state: &AppState, name: &str) -> anyhow::Resu
         let (ok, detail) = stop_session_process(name).await;
         anyhow::ensure!(ok, "{detail}");
     } else {
-        let pane_target = pt(name);
-        let pane = tmux(&["list-panes", "-t", &pane_target, "-F", "#{pane_pid}"]).await;
+        let pt = pt(name);
+        let pane = tmux(&["list-panes", "-t", &pt, "-F", "#{pane_pid}"]).await;
         if let Some(out) = pane.filter(|o| o.status.success()) {
             for line in String::from_utf8_lossy(&out.stdout).lines() {
                 let root: i32 = line.trim().parse()?;
@@ -22208,7 +22209,8 @@ mod tests {
         struct Pane(String);
         impl Drop for Pane {
             fn drop(&mut self) {
-                let _ = std::process::Command::new("tmux").args(["kill-session", "-t", &session_target(&self.0)]).output();
+                let st = session_target(&self.0);
+                let _ = std::process::Command::new("tmux").args(["kill-session", "-t", &st]).output();
             }
         }
         for (kind, command, expected) in [
@@ -27633,13 +27635,15 @@ CLAUDE-POSTFIX-COMPLETE
         struct Pane(String);
         impl Drop for Pane {
             fn drop(&mut self) {
-                let _ = std::process::Command::new("tmux").args(["kill-session", "-t", &session_target(&self.0)]).output();
+                let st = session_target(&self.0);
+                let _ = std::process::Command::new("tmux").args(["kill-session", "-t", &st]).output();
             }
         }
         let pane = Pane(tmux_name(&name));
         let created = tmux(&["new-session", "-d", "-s", &pane.0, "/bin/sh"]).await.expect("tmux required for stop-route proof");
         assert!(created.status.success(), "{}", String::from_utf8_lossy(&created.stderr));
-        let typed = tmux(&["send-keys", "-t", &pt(&name), "/bin/sh -c 'sleep 120 & wait'", "Enter"]).await.unwrap();
+        let pt = pt(&name);
+        let typed = tmux(&["send-keys", "-t", &pt, "/bin/sh -c 'sleep 120 & wait'", "Enter"]).await.unwrap();
         assert!(typed.status.success(), "{}", String::from_utf8_lossy(&typed.stderr));
         sleep_ms(150).await;
         assert_eq!(pane_has_live_child(&name).await, Some(true), "busy-tool fixture must be running");
