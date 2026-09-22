@@ -76,7 +76,7 @@ use crate::api::AppState;
 use crate::db::board_store as bs;
 use rusqlite::Connection;
 use serde_json::{json, Value};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 // ---------------------------------------------------------------------------
 // Knobs. Every threshold in this file is named, defaulted and printed on the
@@ -1695,8 +1695,12 @@ fn detect_latency_with_scan_cap(
     // before this is one fault", which is one question. A second knob would be a
     // second thing to keep in step, and the two detectors disagreeing is the
     // defect being fixed here.
-    if p95_hits.len() >= outlier_rollup_at() {
-        let n_f = p95_hits.len();
+    let distinct_paths: BTreeSet<&str> = p95_hits
+        .iter()
+        .map(|h| h.fam.split_once(' ').expect("p95 family has method and path").1)
+        .collect();
+    if distinct_paths.len() >= outlier_rollup_at() {
+        let n_f = distinct_paths.len();
         let fams: Vec<String> = p95_hits.iter().map(|h| h.fam.clone()).collect();
         let worst = p95_hits
             .iter()
@@ -1710,13 +1714,13 @@ fn detect_latency_with_scan_cap(
             // condition rather than one request.
             signature: format!("latency|p95|ROLLUP|{}", fams.join(",")),
             title: format!(
-                "{n_f} families regressed at once — one event, not {n_f} tasks (worst {worst:.1}x)"
+                "{n_f} paths regressed at once — one event, not {n_f} tasks (worst {worst:.1}x)"
             ),
             evidence: vec![
                 (
                     "verdict".into(),
                     format!(
-                    "{n_f} DIFFERENT families exceeded {mult}x their own trailing p95 in the SAME \
+                    "{n_f} DIFFERENT paths exceeded {mult}x their own trailing p95 in the SAME \
                      window. Each statement is true and each is unactionable alone: nothing in a \
                      per-family payload separates \"this endpoint got slower\" from \"everything \
                      got slower\". Look for something host-wide or server-wide first."
@@ -1746,7 +1750,7 @@ fn detect_latency_with_scan_cap(
                 (
                     "rollup_threshold".into(),
                     format!(
-                        "{} families (AMUX_OUTLIER_ROLLUP_AT, shared with the outlier rollup)",
+                        "{} distinct paths (AMUX_OUTLIER_ROLLUP_AT, shared with the outlier rollup)",
                         outlier_rollup_at()
                     ),
                 ),

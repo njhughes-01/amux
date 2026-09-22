@@ -146,7 +146,7 @@ def classify(card):
         return ("invariant", m.group(1))
     if re.search(r"took [\d.]+s", t) or re.search(r"p\d+ .* norm", t):
         m2 = re.search(r"((?:GET|POST|PATCH|DELETE) )?(/api/[^ ]+)", t)
-        return ("slow", m2.group(2) if m2 else None)
+        return ("slow", (m2.group(1) or "").strip() + " " + m2.group(2) if m2 else None)
     return ("other", None)
 
 
@@ -168,7 +168,10 @@ def main():
         for r in api("GET", "/api/debug/invariants").get("latest_per_invariant", [])
     }
     stats = api("GET", "/api/logs/stats?since_h=24")
-    fam_p95 = {f["family"]: (f.get("p95_ms") or 0, f.get("count") or 0)
+    # `/api/logs/stats` separates latency populations by method and family. A
+    # path-only key would overwrite one method with another and could retire a
+    # still-slow card using an unrelated method's healthy percentile.
+    fam_p95 = {(f.get("method"), f["family"]): (f.get("p95_ms") or 0, f.get("count") or 0)
                for f in stats.get("families", [])}
 
     cards = open_unowned_reports()
@@ -190,17 +193,23 @@ def main():
             else:
                 left.append((cid, f"invariant {key} not in latest_per_invariant — undecidable"))
         elif kind == "slow" and key:
-            fam = "/".join(key.split("/")[:3])
-            p95, n = fam_p95.get(fam, (None, 0))
+            method, _, path = key.partition(" ")
+            if not path:
+                # Pre-method p95 cards cannot be checked against a single
+                # method population safely, so leave them for a hand check.
+                left.append((cid, f"legacy family {method}: method is unknown"))
+                continue
+            fam = "/".join(path.split("/")[:3])
+            p95, n = fam_p95.get((method, fam), (None, 0))
             if p95 is not None and n >= 50 and p95 < 5000:
-                ev = (f"RETIRED by the AMUX-3464 recovery sweep: family {fam} p95 is "
+                ev = (f"RETIRED by the AMUX-3464 recovery sweep: {method} family {fam} p95 is "
                       f"{p95}ms over {n} requests in the last 24h (threshold was 10s-class). "
                       f"No fix claimed; detector re-armed by this discard.")
                 retired.append((cid, ev))
             elif p95 is None or n < 50:
-                left.append((cid, f"family {fam}: insufficient traffic ({n}) — quiet is not recovered"))
+                left.append((cid, f"{method} family {fam}: insufficient traffic ({n}) — quiet is not recovered"))
             else:
-                routed.append((cid, f"family {fam} p95 {p95}ms still slow"))
+                routed.append((cid, f"{method} family {fam} p95 {p95}ms still slow"))
         else:
             left.append((cid, "class needs a hand check"))
 

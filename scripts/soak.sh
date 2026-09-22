@@ -159,10 +159,13 @@ s["stats_ms"] = round(ms, 2)
 fams = {}
 if isinstance(stats, dict):
     for f in stats.get("families", []) or []:
-        name = f.get("family")
-        if not name:
+        family = f.get("family")
+        method = f.get("method")
+        if not family or not method:
             continue
-        fams[name] = {
+        # Stats families are method-plus-path populations. Keep the method in
+        # the snapshot key so a POST cannot overwrite a GET for the same path.
+        fams[f"{method} {family}"] = {
             "count": f.get("count"),
             "p50": f.get("p50_ms"),
             "p95": f.get("p95_ms"),

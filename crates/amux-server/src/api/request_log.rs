@@ -4689,6 +4689,67 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn stats_keeps_same_path_methods_as_distinct_latency_populations() {
+        let (store, _dir) = store();
+        let now = unix_now();
+        for i in 0..5 {
+            seed(
+                &store,
+                now - i as f64,
+                "GET",
+                "/api/board",
+                200,
+                2.0,
+                "lane",
+                "native",
+                None,
+            )
+            .await;
+        }
+        for i in 0..2 {
+            seed(
+                &store,
+                now - 10.0 - i as f64,
+                "POST",
+                "/api/board",
+                201,
+                2200.0,
+                "lane",
+                "native",
+                None,
+            )
+            .await;
+        }
+
+        let api = logs_api(store);
+        let (status, body) = hit(
+            &api,
+            HttpRequest::builder()
+                .uri("/api/logs/stats?since_h=24")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let families = serde_json::from_slice::<Value>(&body).unwrap()["families"]
+            .as_array()
+            .unwrap()
+            .clone();
+        let get = families
+            .iter()
+            .find(|f| f["method"] == "GET" && f["family"] == "/api/board")
+            .unwrap();
+        let post = families
+            .iter()
+            .find(|f| f["method"] == "POST" && f["family"] == "/api/board")
+            .unwrap();
+        assert_eq!(get["count"], 5);
+        assert_eq!(get["p95_ms"], 2.0);
+        assert_eq!(post["count"], 2);
+        assert_eq!(post["p95_ms"], 2200.0);
+    }
+
+    #[tokio::test]
     async fn debug_routes_serves_the_table_with_owner_from_the_boundary_registry() {
         let v = debug_routes().await.0;
         assert_eq!(v["count"], ROUTE_TABLE.len());
