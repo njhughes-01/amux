@@ -76,7 +76,7 @@ use crate::api::AppState;
 use crate::db::board_store as bs;
 use rusqlite::Connection;
 use serde_json::{json, Value};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 // ---------------------------------------------------------------------------
 // Knobs. Every threshold in this file is named, defaulted and printed on the
@@ -1324,6 +1324,7 @@ struct P95Hit {
 /// the p95 path was fixed, and that lesson is already written into
 /// `request_log.rs` a few hundred lines away.
 fn p95_finding(h: &P95Hit, mult: f64, min_n: i64, now: f64) -> Finding {
+    let (method, family) = h.fam.split_once(' ').expect("p95 family has method and path");
     Finding {
         kind: DetectorKind::Latency,
         signature: format!("latency|p95|{}", h.fam),
@@ -1393,9 +1394,9 @@ fn p95_finding(h: &P95Hit, mult: f64, min_n: i64, now: f64) -> Finding {
         ],
         recheck: format!(
             "curl -sk \"$AMUX_URL/api/logs/stats?since_h={}\" | python3 -c \"import json,sys; \
-             d=json.load(sys.stdin); print([f for f in d['families'] if f.get('family')=='{}'])\"",
+             d=json.load(sys.stdin); print([f for f in d['families'] if f.get('method')=='{}' and f.get('family')=='{}'])\"",
             window_h() as i64,
-            h.fam
+            method, family
         ),
         owner: None,
         count: h.win_n as u64,
@@ -1468,7 +1469,7 @@ fn detect_latency_with_scan_cap(
         // ~32k rows and can never be reached by a 400k cap; the baseline is a
         // trailing reference and degrades gracefully by getting shorter, which
         // is reported below rather than hidden.
-        "SELECT family, latency_ms, ts, boot_at, load1 FROM _amux_request_log WHERE ts >= ?1 \
+        "SELECT method, family, latency_ms, ts, boot_at, load1 FROM _amux_request_log WHERE ts >= ?1 \
            AND (req_meta IS NULL OR req_meta NOT LIKE '%\"slow_ok\"%') \
          ORDER BY ts DESC LIMIT ?2",
     ) {
@@ -1476,10 +1477,11 @@ fn detect_latency_with_scan_cap(
             stmt.query_map(rusqlite::params![b_start, scan_cap as i64], |r| {
                 Ok((
                     r.get::<_, String>(0)?,
-                    r.get::<_, f64>(1)?,
+                    r.get::<_, String>(1)?,
                     r.get::<_, f64>(2)?,
-                    r.get::<_, Option<f64>>(3)?,
+                    r.get::<_, f64>(3)?,
                     r.get::<_, Option<f64>>(4)?,
+                    r.get::<_, Option<f64>>(5)?,
                 ))
             })
         {
@@ -1503,7 +1505,7 @@ fn detect_latency_with_scan_cap(
             // drop everything and look exactly like a filter that worked.
             let mut spanned_restart = 0usize;
             let mut considered = 0usize;
-            for (fam, ms, ts, row_boot, row_load) in rows.flatten() {
+            for (method, family, ms, ts, row_boot, row_load) in rows.flatten() {
                 considered += 1;
                 if ts < oldest_seen {
                     oldest_seen = ts;
@@ -1527,6 +1529,10 @@ fn detect_latency_with_scan_cap(
                 if spanned {
                     spanned_restart += 1;
                 }
+                // A path is not a latency family by itself: a POST that does
+                // semantic intake is expected to take seconds, while GET
+                // reads of the same path are ordinarily milliseconds.
+                let fam = format!("{method} {family}");
                 let e = per_family.entry(fam).or_default();
                 if ts >= w_start {
                     e.win_raw += 1;
@@ -1691,8 +1697,12 @@ fn detect_latency_with_scan_cap(
     // before this is one fault", which is one question. A second knob would be a
     // second thing to keep in step, and the two detectors disagreeing is the
     // defect being fixed here.
-    if p95_hits.len() >= outlier_rollup_at() {
-        let n_f = p95_hits.len();
+    let distinct_paths: BTreeSet<&str> = p95_hits
+        .iter()
+        .map(|h| h.fam.split_once(' ').expect("p95 family has method and path").1)
+        .collect();
+    if distinct_paths.len() >= outlier_rollup_at() {
+        let n_f = distinct_paths.len();
         let fams: Vec<String> = p95_hits.iter().map(|h| h.fam.clone()).collect();
         let worst = p95_hits
             .iter()
@@ -1706,13 +1716,13 @@ fn detect_latency_with_scan_cap(
             // condition rather than one request.
             signature: format!("latency|p95|ROLLUP|{}", fams.join(",")),
             title: format!(
-                "{n_f} families regressed at once — one event, not {n_f} tasks (worst {worst:.1}x)"
+                "{n_f} paths regressed at once — one event, not {n_f} tasks (worst {worst:.1}x)"
             ),
             evidence: vec![
                 (
                     "verdict".into(),
                     format!(
-                    "{n_f} DIFFERENT families exceeded {mult}x their own trailing p95 in the SAME \
+                    "{n_f} DIFFERENT paths exceeded {mult}x their own trailing p95 in the SAME \
                      window. Each statement is true and each is unactionable alone: nothing in a \
                      per-family payload separates \"this endpoint got slower\" from \"everything \
                      got slower\". Look for something host-wide or server-wide first."
@@ -1742,7 +1752,7 @@ fn detect_latency_with_scan_cap(
                 (
                     "rollup_threshold".into(),
                     format!(
-                        "{} families (AMUX_OUTLIER_ROLLUP_AT, shared with the outlier rollup)",
+                        "{} distinct paths (AMUX_OUTLIER_ROLLUP_AT, shared with the outlier rollup)",
                         outlier_rollup_at()
                     ),
                 ),
@@ -9168,7 +9178,7 @@ mod tests {
             fault_identity(r1),
             "a p95 rollup and an outlier rollup are different detectors"
         );
-        assert_eq!(fault_identity("latency|p95|/api/board"), None);
+        assert_eq!(fault_identity("latency|p95|GET /api/board"), None);
 
         // Invariant signatures dedup by invariant name: all violations of the
         // same invariant (different entities, different episodes) are one fault.
@@ -11399,7 +11409,7 @@ mod tests {
         // And the suppression must no longer be sayable by a quiet endpoint.
         let sup_txt = s
             .iter()
-            .find(|x| x.signature == "latency|p95|/api/collapse")
+            .find(|x| x.signature == "latency|p95|GET /api/collapse")
             .map(|x| x.reason.clone())
             .unwrap_or_default();
         assert!(
@@ -11418,7 +11428,7 @@ mod tests {
         );
         assert!(
             !s2.iter()
-                .any(|x| x.signature == "latency|p95|/api/collapse"),
+                .any(|x| x.signature == "latency|p95|GET /api/collapse"),
             "a 60-row baseline needs no suppression — if this fires the rows were dropped: {s2:?}"
         );
     }
@@ -11594,7 +11604,7 @@ mod tests {
         );
         let fresh = s
             .iter()
-            .find(|x| x.signature == "latency|p95|/api/fresh")
+            .find(|x| x.signature == "latency|p95|GET /api/fresh")
             .map(|x| x.reason.clone())
             .unwrap_or_default();
         assert!(
@@ -11607,7 +11617,7 @@ mod tests {
         );
         let thin = s
             .iter()
-            .find(|x| x.signature == "latency|p95|/api/thin")
+            .find(|x| x.signature == "latency|p95|GET /api/thin")
             .map(|x| x.reason.clone())
             .unwrap_or_default();
         assert!(
@@ -11669,7 +11679,7 @@ mod tests {
             "a 6ms row from before this boot never spanned anything and must be kept: {f:?}"
         );
         assert!(
-            !s.iter().any(|x| x.signature == "latency|p95|/api/hist"),
+            !s.iter().any(|x| x.signature == "latency|p95|GET /api/hist"),
             "120 intact rows need no suppression — this firing means the baseline was eaten: {s:?}"
         );
     }
@@ -11924,7 +11934,7 @@ mod tests {
 
         let hit = f
             .iter()
-            .find(|x| x.signature == "latency|p95|/api/sessions")
+            .find(|x| x.signature == "latency|p95|GET /api/sessions")
             .expect("the window is complete under a descending scan, so the real regression files");
         let ev: BTreeMap<_, _> = hit.evidence.iter().cloned().collect();
 
@@ -11984,7 +11994,7 @@ mod tests {
         let (f, _) = detect_latency_at(&conn, now, None);
         let ev: BTreeMap<_, _> = f
             .iter()
-            .find(|x| x.signature == "latency|p95|/api/sessions")
+            .find(|x| x.signature == "latency|p95|GET /api/sessions")
             .expect("a real regression still files")
             .evidence
             .iter()
@@ -12053,7 +12063,7 @@ mod tests {
         }
         let (f2, _) = detect_latency(&st2.store.read().unwrap(), now);
         assert!(
-            f2.iter().any(|x| x.signature == "latency|p95|/api/browser"),
+            f2.iter().any(|x| x.signature == "latency|p95|POST /api/browser"),
             "unmarked 5s rows must still file — the control keeps the skip honest: {f2:?}"
         );
     }
@@ -12100,9 +12110,57 @@ mod tests {
         }
         let (f, _) = detect_latency(&st.store.read().unwrap(), now);
         assert!(
-            !f.iter().any(|x| x.signature == "latency|p95|/api/prefs"),
+            !f.iter().any(|x| x.signature == "latency|p95|GET /api/prefs"),
             "2ms at 3.7x is fast-vs-faster noise, not a regression: {f:?}"
         );
+    }
+
+    /// GC2-16: semantic-intake POSTs are deliberately slower than dashboard
+    /// reads of the same path. The p95 baseline must be keyed by method as
+    /// well as path; otherwise a few card creations poison the GET family.
+    #[tokio::test]
+    async fn p95_keeps_post_card_creates_out_of_get_board_reads() {
+        let (st, _d) = state();
+        let now = unix_now();
+        for i in 0..60 {
+            log_row(&st, Row {
+                ts: now - 200_000.0 - i as f64, method: "GET", path: "/api/board",
+                family: "/api/board", status: 200, body: "", worker: "", ua: "curl/8", ms: 5.0,
+            });
+            log_row(&st, Row {
+                ts: now - 100.0 - i as f64, method: "GET", path: "/api/board",
+                family: "/api/board", status: 200, body: "", worker: "", ua: "curl/8", ms: 5.0,
+            });
+        }
+        // Four creates are enough to move a path-only p95, but must not alter
+        // the ordinary GET family.
+        for i in 0..4 {
+            log_row(&st, Row {
+                ts: now - 100.0 - i as f64, method: "POST", path: "/api/board",
+                family: "/api/board", status: 201, body: "", worker: "", ua: "curl/8", ms: 2_200.0,
+            });
+        }
+        let (f, _) = detect_latency(&st.store.read().unwrap(), now);
+        assert!(
+            !f.iter().any(|x| x.signature == "latency|p95|GET /api/board"),
+            "ordinary GET reads must not inherit POST creation latency: {f:?}"
+        );
+
+        // Control: a genuine GET regression on the same path still files.
+        for i in 0..60 {
+            log_row(&st, Row {
+                ts: now - 200.0 - i as f64, method: "GET", path: "/api/board",
+                family: "/api/board", status: 200, body: "", worker: "", ua: "curl/8", ms: 2_200.0,
+            });
+        }
+        let (f, _) = detect_latency(&st.store.read().unwrap(), now);
+        let hit = f.iter().find(|x| x.signature == "latency|p95|GET /api/board");
+        assert!(
+            hit.is_some(),
+            "a real GET regression must remain visible: {f:?}"
+        );
+        assert!(hit.unwrap().recheck.contains("f.get('method')=='GET' and f.get('family')=='/api/board'"),
+            "the recheck must use the detector's method-plus-path family");
     }
 
     /// A p95 over four requests is one request wearing a percentile. Both
@@ -12147,7 +12205,7 @@ mod tests {
         }
         let (f, s) = detect_latency(&st.store.read().unwrap(), now);
         assert!(
-            !f.iter().any(|x| x.signature == "latency|p95|/api/slow"),
+            !f.iter().any(|x| x.signature == "latency|p95|GET /api/slow"),
             "a 3-sample baseline cannot support a p95 verdict: {f:?}"
         );
         assert!(
@@ -12176,7 +12234,7 @@ mod tests {
         let (f2, _) = detect_latency(&st.store.read().unwrap(), now);
         let hit = f2
             .iter()
-            .find(|x| x.signature == "latency|p95|/api/slow")
+            .find(|x| x.signature == "latency|p95|GET /api/slow")
             .expect("a 800x p95 regression over 60 samples must file");
         let ev: BTreeMap<_, _> = hit.evidence.iter().cloned().collect();
         assert!(
@@ -12249,8 +12307,8 @@ mod tests {
         fast_then_slow(&st, now, "/api/two-b");
         let (f, _) = detect_latency(&st.store.read().unwrap(), now);
         assert!(
-            f.iter().any(|x| x.signature == "latency|p95|/api/two-a")
-                && f.iter().any(|x| x.signature == "latency|p95|/api/two-b"),
+            f.iter().any(|x| x.signature == "latency|p95|GET /api/two-a")
+                && f.iter().any(|x| x.signature == "latency|p95|GET /api/two-b"),
             "two regressions are two endpoints until the threshold says otherwise: {:?}",
             f.iter().map(|x| &x.signature).collect::<Vec<_>>()
         );
@@ -12278,7 +12336,7 @@ mod tests {
         );
         assert!(
             !f3.iter()
-                .any(|x| x.signature.starts_with("latency|p95|/api/three")),
+                .any(|x| x.signature.starts_with("latency|p95|GET /api/three")),
             "the per-family cards must be REPLACED, not accompanied — otherwise the rollup \
              adds a card instead of collapsing three: {:?}",
             f3.iter().map(|x| &x.signature).collect::<Vec<_>>()
@@ -13720,7 +13778,7 @@ mod tests {
         // CONTROLS: other detectors' signatures must not match.
         for sig in [
             "5xx|500|POST|/api/quiet|/api/quiet",
-            "latency|p95|/api/board",
+            "latency|p95|GET /api/board",
             "dead-route|404|GET|/api/auth",
             "invariant|only-two-parts",
             "invariant||amux",
