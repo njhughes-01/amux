@@ -11223,7 +11223,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.980';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.981';   // bump together with the sw.js CACHE version
 // Warm the shared catalog so model-type filters are exact on first use. A
 // failure is non-fatal (custom ids and the open-string fallback still work)
 // and is already reported by _loadModelCatalog.
@@ -42022,19 +42022,24 @@ function _bwRefreshInspect() {
 }
 async function _bwLoadInspect() {
   const list = document.getElementById('bw-inspect-list');
-  if (list && !list.children.length) list.innerHTML = '<div class="il-empty">Loading…</div>';
+  if (list && !list.children.length && _bwInspActiveTab === 'console') list.innerHTML = '<div class="il-empty">Loading…</div>';
   try {
     const r = await _bwFetch('/api/browser/inspect?session=' + _bwSession + '&limit=300');
     const d = await r.json();
-    if (d.error) { list.innerHTML = '<div class="il-empty">' + esc(d.error) + '</div>'; return; }
-    _bwInspData = { console: d.console || [], network: d.network || [], errors: d.errors || [] };
+    if (d.error) {
+      if (_bwInspActiveTab !== 'trail') list.innerHTML = '<div class="il-empty">' + esc(d.error) + '</div>';
+      return;
+    }
+    Object.assign(_bwInspData, { console: d.console || [], network: d.network || [], errors: d.errors || [] });
     const c = d.counts || {};
     document.getElementById('bw-ic-console').textContent = c.console ? '(' + c.console + ')' : '';
     document.getElementById('bw-ic-network').textContent = c.network ? '(' + c.network + ')' : '';
     document.getElementById('bw-ic-errors').textContent = c.errors ? '(' + c.errors + ')' : '';
-    _bwRenderInspect();
+    // Trail loads race with this request when the panel opens. Never let a
+    // late console response overwrite the tab the user selected.
+    if (_bwInspActiveTab !== 'trail') _bwRenderInspect();
   } catch(e) {
-    list.innerHTML = '<div class="il-empty">Error: ' + esc(e.message) + '</div>';
+    if (_bwInspActiveTab !== 'trail') list.innerHTML = '<div class="il-empty">Error: ' + esc(e.message) + '</div>';
   }
 }
 function _bwRenderInspect() {
@@ -42092,7 +42097,7 @@ function _bwRenderInspect() {
 }
 async function _bwLoadTrail() {
   const list = document.getElementById('bw-inspect-list');
-  if (list) list.innerHTML = '<div class="il-empty">Loading durable trail…</div>';
+  if (list && _bwInspActiveTab === 'trail') list.innerHTML = '<div class="il-empty">Loading durable trail…</div>';
   try {
     const r = await fetch('/api/browser/history?session=' + encodeURIComponent(_bwSession) + '&limit=100');
     const d = await r.json();
@@ -42108,11 +42113,11 @@ async function _bwLoadTrail() {
     if (count) count.textContent = _bwTrailMeta.n_considered
       ? '(' + _bwTrailMeta.returned + (_bwTrailMeta.truncated ? '/' + _bwTrailMeta.n_considered : '') + ')'
       : '';
-    _bwRenderInspect();
+    if (_bwInspActiveTab === 'trail') _bwRenderInspect();
   } catch(e) {
     _bwTrailMeta = { measured: false, n_considered: 0, returned: 0, truncated: false };
     _bwInspData.trail = [];
-    if (list) list.innerHTML = '<div class="il-empty">Trail unavailable: ' + esc(e.message) + '</div>';
+    if (list && _bwInspActiveTab === 'trail') list.innerHTML = '<div class="il-empty">Trail unavailable: ' + esc(e.message) + '</div>';
   }
 }
 async function _bwClearInspect() {
