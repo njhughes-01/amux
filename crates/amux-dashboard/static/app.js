@@ -42027,19 +42027,19 @@ async function _bwLoadInspect() {
     const r = await _bwFetch('/api/browser/inspect?session=' + _bwSession + '&limit=300');
     const d = await r.json();
     if (d.error) {
-      if (_bwInspActiveTab === 'console') list.innerHTML = '<div class="il-empty">' + esc(d.error) + '</div>';
+      if (_bwInspActiveTab !== 'trail') list.innerHTML = '<div class="il-empty">' + esc(d.error) + '</div>';
       return;
     }
-    _bwInspData = { console: d.console || [], network: d.network || [], errors: d.errors || [] };
+    Object.assign(_bwInspData, { console: d.console || [], network: d.network || [], errors: d.errors || [] });
     const c = d.counts || {};
     document.getElementById('bw-ic-console').textContent = c.console ? '(' + c.console + ')' : '';
     document.getElementById('bw-ic-network').textContent = c.network ? '(' + c.network + ')' : '';
     document.getElementById('bw-ic-errors').textContent = c.errors ? '(' + c.errors + ')' : '';
     // Trail loads race with this request when the panel opens. Never let a
     // late console response overwrite the tab the user selected.
-    if (_bwInspActiveTab === 'console') _bwRenderInspect();
+    if (_bwInspActiveTab !== 'trail') _bwRenderInspect();
   } catch(e) {
-    if (_bwInspActiveTab === 'console') list.innerHTML = '<div class="il-empty">Error: ' + esc(e.message) + '</div>';
+    if (_bwInspActiveTab !== 'trail') list.innerHTML = '<div class="il-empty">Error: ' + esc(e.message) + '</div>';
   }
 }
 function _bwRenderInspect() {
