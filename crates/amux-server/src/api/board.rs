@@ -13882,6 +13882,16 @@ fn is_needs_human_tag(tag: &str, owner_marker: Option<&str>) -> bool {
         || owner_marker.is_some_and(|m| t == format!("needs:{m}") || t == format!("awaiting-{m}"))
 }
 
+/// Who may answer a needs-you card (sec-a): the owner credential (bearer or
+/// `_token=`, the same forms `require_bearer` accepts) or a server-verified
+/// member. With no owner credential configured (`AMUX_AUTH_TOKEN=none`) there
+/// is nothing to require, so the answer is accepted as before.
+fn answer_credential_ok(state: &AppState, headers: &HeaderMap, uri: &axum::http::Uri) -> bool {
+    state.auth_token.is_none()
+        || super::auth::has_owner_token(state, headers, uri)
+        || super::org::local_member_actor(headers).is_some()
+}
+
 /// The owner's answer to a needs-you card: approve, reject, or a typed reply
 /// (LC-29).
 ///
@@ -13895,19 +13905,34 @@ fn is_needs_human_tag(tag: &str, owner_marker: Option<&str>) -> bool {
 /// outcome is logged on the card too.
 ///
 /// Workers ask; they do not answer. A request carrying a worker identity is
-/// refused, so no lane can approve its own ask.
+/// refused, so no lane can approve its own ask. An anonymous local caller
+/// cannot answer either: when the server has an owner credential configured,
+/// an answer needs that credential or a verified member session (sec-a). The
+/// loopback auth bypass otherwise let any local process that simply omitted
+/// its session header be recorded as the owner answering.
 async fn answer_ask(
     State(state): State<AppState>,
     Path(id): Path<String>,
     headers: HeaderMap,
+    uri: axum::http::Uri,
     body: Option<Json<Value>>,
 ) -> Response {
     let worker = crate::api::groups::hdr_worker(&headers);
-    if !worker.is_empty() {
+    // A verified member is a human, not a worker, even though the member
+    // middleware also stamps `x-amux-session: member:<email>` for attribution.
+    let member = super::org::local_member_actor(&headers).is_some();
+    if !worker.is_empty() && !member {
         tracing::warn!(card = %id, worker = %worker, verdict = "answer_refused_worker", "a worker tried to answer a needs-you card");
         return err(StatusCode::FORBIDDEN, json!({
             "error": "only the owner answers a needs-you card; workers ask, they do not answer",
             "code": "answer_requires_owner",
+        }));
+    }
+    if !answer_credential_ok(&state, &headers, &uri) {
+        tracing::warn!(card = %id, verdict = "answer_refused_no_credential", "a needs-you answer arrived without the owner credential or a member session");
+        return err(StatusCode::FORBIDDEN, json!({
+            "error": "answering a needs-you card requires the owner's credential or a member session",
+            "code": "answer_requires_owner_credential",
         }));
     }
     let body = body.map(|Json(v)| v).unwrap_or(Value::Null);
