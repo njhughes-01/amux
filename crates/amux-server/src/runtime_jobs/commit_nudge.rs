@@ -1816,8 +1816,18 @@ fn owner_name(entry: &Value) -> String {
 /// this", with two consumers. Two implementations diverge and each looks correct
 /// alone, which is exactly how the guard said MINE=0 while the nudge said 11
 /// files were mine, at the same moment about the same files.
+/// The guard request body. It carries an explicit `op`: the guard treats a caller
+/// that sends neither `op` nor `guard_version` as a PRE-RUST git hook and warns
+/// "OUTDATED HOOK" (git_guard.rs `hook_is_outdated`). Without it this probe, the
+/// server calling itself, produced the per-lane warnings blaming a current hook
+/// (AMUX-78, 2026-09-23: 82 of 85 in one log; the 3 with no session and no dir
+/// come from a different caller).
+fn guard_probe_body(session: &str, dir: &str, paths: &[String]) -> Value {
+    json!({ "dir": dir, "session": session, "paths": paths, "op": "nudge-probe" })
+}
+
 async fn ownership_from_guard(session: &str, dir: &str, paths: &[String]) -> Option<Ownership> {
-    let body = json!({ "dir": dir, "session": session, "paths": paths });
+    let body = guard_probe_body(session, dir, paths);
     let mut headers = axum::http::HeaderMap::new();
     if let Ok(v) = axum::http::HeaderValue::from_str(session) {
         headers.insert("x-amux-session", v);
@@ -2909,6 +2919,14 @@ async fn drain_revived(dir: &str, pending_revived: &[String], fresh: &mut Freshn
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_guard_probe_declares_an_op_so_it_is_not_read_as_an_outdated_hook() {
+        let body = super::guard_probe_body("lane", "/tmp/x", &["a.rs".to_string()]);
+        let op = body.get("op").and_then(serde_json::Value::as_str).unwrap_or("");
+        assert!(!op.is_empty(), "an op-less probe is judged a pre-rust hook: {body}");
+        assert_eq!(body.get("dir").and_then(serde_json::Value::as_str), Some("/tmp/x"));
+    }
+
     /// A nudge may not exist without stating what it was measured against —
     /// asserted on EVERY branch, because the signature alone only proves the
     /// caller supplied a scope, not that the reader ever sees it. Both exits
