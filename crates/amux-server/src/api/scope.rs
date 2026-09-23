@@ -1569,7 +1569,9 @@ mod tests {
         .await;
         assert_eq!(s, StatusCode::OK, "{v}");
         let env_txt = std::fs::read_to_string(home.path().join("env/alpha.env")).unwrap();
-        assert_eq!(env_txt, "KEEP=x\nNEW=val\n");
+        // Group env files are sourced into lanes, so the merge writes the one
+        // quoted/escaped shape every env reader agrees on (config::env_assignment).
+        assert_eq!(env_txt, "KEEP=\"x\"\nNEW=\"val\"\n");
         assert_eq!(v["value"]["keys"], json!(["KEEP", "NEW"]));
         #[cfg(unix)]
         {
