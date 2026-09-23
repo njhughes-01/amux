@@ -220,6 +220,15 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - uses: actions/setup-node@v4
         with: { node-version: '22', cache: 'npm' }
+      # AF-932. The Rust test job installs tmux; this job never did.
+      # The dashboard's own session/fleet code shells out to `tmux
+      # list-sessions` and degrades gracefully (a WARN log, "fleet will read
+      # as not-running") when it is missing — but a golden scenario that
+      # asserts on real running-session state has nothing graceful to show
+      # instead, so the gap surfaced as `element(s) not found` /
+      # `toBeVisible()` failures rather than as this job's own missing step.
+      - name: Install tmux (dashboard session state depends on it)
+        run: command -v tmux >/dev/null || { sudo apt-get update && sudo apt-get install -y tmux; }
       # The browsers are ~46s of every shard of every run, and they are pure
       # inputs: the same playwright version downloads the same binaries. Keyed
       # on the lockfile, so a version bump misses the cache and re-downloads —
