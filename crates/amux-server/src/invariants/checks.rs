@@ -126,16 +126,31 @@ const MOUNTED_ANSWERS_BLIND_SPOTS: &[&str] = &[
      shapes are named in OPTIONAL_DEPENDENCY_ROUTES and appear under `dependency_down` \
      in the evidence rather than as findings — the daemon being down is still true and \
      still published, it is just not this invariant's business",
+    "A FINDING DOES NOT SELF-HEAL WITHIN THE WINDOW. This reads a 14-day span, so a \
+     burst of failures on day one holds a shape failing for the remaining thirteen, and \
+     a fix dilutes it only if something keeps calling the path. Read `last_seen_age_h` \
+     before treating a finding as live: 12 calls to /api/board-lifecycle/ on 2026-09-15 \
+     pinned that shape until 09-29 no matter what shipped, and AMUX-4674 read the \
+     result as 'has not self-healed'",
 ];
 
 /// One (method, route-shape) group from the request log. `shape` must come from
 /// `normalize_target_verb`, not `family` — see the granularity note above.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct RouteOutcomeRow {
     pub method: String,
     pub shape: String,
     pub n: i64,
     pub ok: i64,
+    /// 3xx: the route ANSWERED and sent the caller somewhere else (AMUX-4753).
+    ///
+    /// Counted as answering, which `ok` alone cannot express. A route whose
+    /// correct behaviour is a redirect — `/api/_clear_sw`, an owner-session
+    /// bootstrap, anything that 308s a legacy spelling to its canonical one —
+    /// has 0% 2xx and is doing its job. Before this existed, shipping such a
+    /// route made this invariant fail permanently, so the check punished the
+    /// fix.
+    pub redirect: i64,
     /// 4xx: the route ANSWERED and refused. Carried separately because "0% 2xx"
     /// cannot tell a working authorization gate from a dead route, and this
     /// check reported `POST /api/email/reply 0/12 2xx` as a failure while all
@@ -159,6 +174,20 @@ pub struct RouteOutcomeRow {
     /// panic. See `OPTIONAL_DEPENDENCY_ROUTES` for what is done with it, which
     /// is deliberately narrow.
     pub unavailable: i64,
+    /// Unix seconds of the most recent call in this group, or `None` when the
+    /// producer did not measure it (AMUX-4753).
+    ///
+    /// WITHOUT THIS A READER CANNOT TELL A LIVE FAULT FROM A HEALED ONE. The
+    /// window is fourteen days, so a burst of failures on day one holds a shape
+    /// failing for the remaining thirteen, and nothing dilutes it if the client
+    /// that produced the burst has since stopped calling. The live specimen is
+    /// this field's own card: 12 bad calls to `/api/board-lifecycle/` on
+    /// 2026-09-15 pinned that shape until 09-29 regardless of any fix, and
+    /// AMUX-4674 read the result as "has not self-healed".
+    ///
+    /// `None`, never 0.0. A zero would render as an age of decades and read as
+    /// a measurement rather than an absence.
+    pub last_seen: Option<f64>,
 }
 
 /// Routes that front an OPTIONAL external process, with the process named.
@@ -191,8 +220,39 @@ fn optional_dependency_for(method: &str, shape: &str) -> Option<&'static str> {
 /// Minimum calls before a shape is judged at all. Named rather than inlined so
 /// blind spot 1 and the code cannot drift apart.
 const MOUNTED_ANSWERS_MIN_N: i64 = 10;
-/// A shape is "not answering" below this 2xx percentage.
+/// A shape is "not answering" below this answered percentage.
 const MOUNTED_ANSWERS_MAX_OK_PCT: i64 = 10;
+
+/// Did this route ANSWER, rather than only succeed (AMUX-4753)?
+///
+/// 2xx plus 3xx. The question this check asks is whether a mounted route
+/// responds at all, and a redirect is a response: the caller is told where to
+/// go and gets there. Counting only 2xx meant that shipping a route whose right
+/// answer is a redirect made this invariant fail forever, which is a check
+/// punishing the fix rather than the fault.
+///
+/// One function rather than `r.ok + r.redirect` at each site: the threshold
+/// test appears three times (the dependency-down census, the judge loop, and
+/// the tests), and three spellings of one predicate is how the census and the
+/// verdict come to disagree about the same row.
+fn answered(r: &RouteOutcomeRow) -> i64 {
+    r.ok + r.redirect
+}
+
+/// Below the answering threshold, on the same definition everywhere.
+fn under_threshold(r: &RouteOutcomeRow) -> bool {
+    answered(r) * 100 <= r.n * MOUNTED_ANSWERS_MAX_OK_PCT
+}
+
+/// Hours since the last call in a group, or `None` when the producer supplied
+/// no recency. Rounded to one decimal: the reader's question is "today or last
+/// week", and a full float would imply a precision the 14-day window does not
+/// have.
+fn last_seen_age_h(r: &RouteOutcomeRow) -> Option<f64> {
+    let last = r.last_seen?;
+    let age = (crate::config::now_f64() - last) / 3600.0;
+    Some((age.max(0.0) * 10.0).round() / 10.0)
+}
 
 pub fn mounted_routes_answer(
     rows: &[RouteOutcomeRow],
@@ -222,7 +282,7 @@ pub fn mounted_routes_answer(
     // the confident-zero shape this file exists to stop.
     let dependency_down: Vec<serde_json::Value> = judged
         .iter()
-        .filter(|r| r.ok * 100 <= r.n * MOUNTED_ANSWERS_MAX_OK_PCT)
+        .filter(|r| under_threshold(r))
         .filter_map(|r| {
             let daemon = optional_dependency_for(&r.method, &r.shape)?;
             (r.unavailable > 0 && r.server_err == r.unavailable).then(|| {
@@ -254,7 +314,7 @@ pub fn mounted_routes_answer(
     let mut out = Vec::new();
     let mut failed = 0usize;
     for r in &judged {
-        if r.ok * 100 > r.n * MOUNTED_ANSWERS_MAX_OK_PCT {
+        if !under_threshold(r) {
             continue; // answering well enough
         }
         // MOUNTED filter. An unmounted path failing is a client guessing a URL,
@@ -272,11 +332,21 @@ pub fn mounted_routes_answer(
             continue;
         }
         failed += 1;
+        // WHEN, beside WHETHER (AMUX-4753). The window is fourteen days, so a
+        // burst on day one holds a shape failing for the remaining thirteen and
+        // no fix can dilute it if nothing calls the path anymore. Without an age
+        // here a reader cannot tell that from a route failing right now, and
+        // AMUX-4674 read exactly this shape as "has not self-healed".
+        let age_h = last_seen_age_h(r);
+        let recency = match age_h {
+            Some(h) => format!(", last {h}h ago"),
+            None => String::new(),
+        };
         out.push(
             InvariantResult::fail(
                 ID,
                 format!(
-                    "a route in ROUTE_TABLE answers 2xx for more than {}% of its calls",
+                    "a route in ROUTE_TABLE answers (2xx or 3xx) for more than {}% of its calls",
                     MOUNTED_ANSWERS_MAX_OK_PCT
                 ),
                 // The SPLIT beside the count, not the count alone. A reader
@@ -285,18 +355,31 @@ pub fn mounted_routes_answer(
                 // job. Naming what should appear BESIDE the answer is the
                 // whole of ethos rule 4.
                 format!(
-                    "{} {} — {}/{} 2xx ({} 4xx, {} 5xx)",
-                    r.method, r.shape, r.ok, r.n, r.client_err, r.server_err
+                    "{} {} — {}/{} answered ({} 2xx, {} 3xx, {} 4xx, {} 5xx){}",
+                    r.method,
+                    r.shape,
+                    answered(r),
+                    r.n,
+                    r.ok,
+                    r.redirect,
+                    r.client_err,
+                    r.server_err,
+                    recency
                 ),
             )
             .entity(format!("{} {}", r.method, r.shape))
             .evidence(ev(serde_json::json!({
                 "n": r.n,
                 "ok": r.ok,
+                "answered": answered(r),
+                "redirect_3xx": r.redirect,
                 "client_err_4xx": r.client_err,
                 "server_err_5xx": r.server_err,
                 "unavailable_503": r.unavailable,
                 "refusal_shaped": r.server_err == 0 && r.client_err > 0,
+                // null means the producer did not measure recency, which is not
+                // the same as "called just now".
+                "last_seen_age_h": age_h,
             }))),
         );
     }
@@ -5608,6 +5691,7 @@ mod negative_controls {
                 client_err: 12,
                 server_err: 0,
                 unavailable: 0,
+                ..Default::default()
             },
             // A route actually FAILING. Same 0% 2xx, opposite meaning.
             //
@@ -5625,6 +5709,7 @@ mod negative_controls {
                 client_err: 0,
                 server_err: 44,
                 unavailable: 0,
+                ..Default::default()
             },
         ];
         let rs = mounted_routes_answer(&rows, &mounted);
@@ -5643,12 +5728,12 @@ mod negative_controls {
         // THE DISCRIMINATOR. Without the split both observed lines read "0/N 2xx"
         // and nothing in the payload separates a refusal from a failure.
         assert!(
-            gate.observed.contains("(12 4xx, 0 5xx)"),
+            gate.observed.contains("(0 2xx, 0 3xx, 12 4xx, 0 5xx)"),
             "the gate must publish its refusal shape: {}",
             gate.observed
         );
         assert!(
-            dead.observed.contains("(0 4xx, 44 5xx)"),
+            dead.observed.contains("(0 2xx, 0 3xx, 0 4xx, 44 5xx)"),
             "the dead route must publish its failure shape: {}",
             dead.observed
         );
@@ -5682,6 +5767,7 @@ mod negative_controls {
                 client_err: 0,
                 server_err: 46,
                 unavailable: 46,
+                ..Default::default()
             }],
             &mounted,
         );
@@ -5709,6 +5795,7 @@ mod negative_controls {
                 client_err: 0,
                 server_err: 46,
                 unavailable: 0,
+                ..Default::default()
             }],
             &mounted,
         );
@@ -5729,12 +5816,100 @@ mod negative_controls {
                 client_err: 0,
                 server_err: 46,
                 unavailable: 46,
+                ..Default::default()
             }],
             &mounted,
         );
         assert!(
             rs.iter().any(|r| r.status == Status::Fail),
             "503 is not blanket-exempt, only declared optional daemons are: {rs:?}"
+        );
+    }
+
+    /// AMUX-4753. A 3xx is the route ANSWERING, and counting only 2xx made this
+    /// check punish the fix: ship a route whose right behaviour is a redirect
+    /// and the invariant fails forever, because every call increments `n` and
+    /// none increments `ok`.
+    ///
+    /// The control is the leg that keeps it from being "3xx is always fine": a
+    /// shape with the same n and no 3xx at all still fails.
+    #[test]
+    fn a_route_that_redirects_is_answering_and_one_that_only_refuses_is_not() {
+        let mounted: Vec<(&str, &[&str])> = vec![("/api/legacy/thing", &["GET"])];
+        let redirecting = RouteOutcomeRow {
+            method: "GET".into(),
+            shape: "/api/legacy/thing".into(),
+            n: 40,
+            ok: 0,
+            redirect: 40,
+            ..Default::default()
+        };
+        let rs = mounted_routes_answer(std::slice::from_ref(&redirecting), &mounted);
+        assert!(
+            !rs.iter().any(|r| r.status == Status::Fail),
+            "40 of 40 redirects is a route answering, not a route failing: {rs:?}"
+        );
+
+        // THE CONTROL. Same route, same n, zero 3xx: still a finding.
+        let refusing = RouteOutcomeRow { redirect: 0, client_err: 40, ..redirecting.clone() };
+        let rs = mounted_routes_answer(&[refusing], &mounted);
+        assert_eq!(
+            rs.iter().filter(|r| r.status == Status::Fail).count(),
+            1,
+            "with the redirects removed the same shape must still fail: {rs:?}"
+        );
+        let fail = rs.iter().find(|r| r.status == Status::Fail).unwrap();
+        assert!(
+            fail.observed.contains("0 3xx"),
+            "the 3xx column must be published beside the count so a reader can tell \
+             which kind of answer was missing: {}",
+            fail.observed
+        );
+    }
+
+    /// AMUX-4753. The window is fourteen days, so a burst on day one holds a
+    /// shape failing for the remaining thirteen and nothing dilutes it once the
+    /// client that produced it stops calling. Without an age beside the verdict
+    /// a reader cannot tell that from a live fault, and AMUX-4674 read exactly
+    /// this shape as "has not self-healed".
+    #[test]
+    fn a_finding_says_how_old_its_newest_call_is_and_says_when_it_does_not_know() {
+        let mounted: Vec<(&str, &[&str])> = vec![("/api/board-lifecycle", &["GET"])];
+        let stale = RouteOutcomeRow {
+            method: "GET".into(),
+            shape: "/api/board-lifecycle".into(),
+            n: 12,
+            ok: 0,
+            client_err: 12,
+            // Two days back, the real specimen's own age when this was written.
+            last_seen: Some(crate::config::now_f64() - 2.0 * 86400.0),
+            ..Default::default()
+        };
+        let rs = mounted_routes_answer(std::slice::from_ref(&stale), &mounted);
+        let fail = rs.iter().find(|r| r.status == Status::Fail).expect("still a finding");
+        let age = fail.evidence["detail"]["last_seen_age_h"].as_f64().expect("an age");
+        assert!((47.0..=49.0).contains(&age), "expected ~48h, got {age}");
+        assert!(
+            fail.observed.contains("last 48h ago") || fail.observed.contains("48h ago"),
+            "the age belongs in the sentence a reader sees, not only in the evidence: {}",
+            fail.observed
+        );
+
+        // NOT MEASURED IS NOT "JUST NOW". A producer that supplies no recency
+        // must publish null rather than an age derived from a zero timestamp,
+        // which would render as decades and read as a measurement.
+        let unknown = RouteOutcomeRow { last_seen: None, ..stale };
+        let rs = mounted_routes_answer(&[unknown], &mounted);
+        let fail = rs.iter().find(|r| r.status == Status::Fail).expect("still a finding");
+        assert!(
+            fail.evidence["detail"]["last_seen_age_h"].is_null(),
+            "an unmeasured recency must be null: {}",
+            fail.evidence
+        );
+        assert!(
+            !fail.observed.contains("ago"),
+            "with no recency measured the sentence must not claim one: {}",
+            fail.observed
         );
     }
 
@@ -5746,16 +5921,16 @@ mod negative_controls {
         ];
         let rows = vec![
             // The live specimen: mounted, called 15 times, answered 0.
-            RouteOutcomeRow { method: "GET".into(), shape: "/api/workers/{id}".into(), n: 15, ok: 0, client_err: 15, server_err: 0, unavailable: 0 },
+            RouteOutcomeRow { method: "GET".into(), shape: "/api/workers/{id}".into(), n: 15, ok: 0, client_err: 15, server_err: 0, unavailable: 0, ..Default::default() },
             // ARM 2 — a HEALTHY mounted route. Without this the check could
             // flag everything and still pass arm 1.
-            RouteOutcomeRow { method: "POST".into(), shape: "/api/workers/{id}/send".into(), n: 4368, ok: 4006, client_err: 300, server_err: 62, unavailable: 0 },
+            RouteOutcomeRow { method: "POST".into(), shape: "/api/workers/{id}/send".into(), n: 4368, ok: 4006, client_err: 300, server_err: 62, unavailable: 0, ..Default::default() },
             // Below the threshold: judged on nothing, so reported as nothing.
-            RouteOutcomeRow { method: "GET".into(), shape: "/api/workers/{id}".into(), n: 0, ok: 0, client_err: 0, server_err: 0, unavailable: 0 },
+            RouteOutcomeRow { method: "GET".into(), shape: "/api/workers/{id}".into(), n: 0, ok: 0, client_err: 0, server_err: 0, unavailable: 0, ..Default::default() },
             // UNMOUNTED and failing: a client guessing a URL. /api/logs/analyze
             // already reports these as 404 groups with nearest_routes, and this
             // check must not double-file them.
-            RouteOutcomeRow { method: "GET".into(), shape: "/api/stripe/status".into(), n: 430, ok: 0, client_err: 430, server_err: 0, unavailable: 0 },
+            RouteOutcomeRow { method: "GET".into(), shape: "/api/stripe/status".into(), n: 430, ok: 0, client_err: 430, server_err: 0, unavailable: 0, ..Default::default() },
         ];
         let rs = mounted_routes_answer(&rows, &mounted);
         let fails: Vec<_> = rs.iter().filter(|r| r.status == Status::Fail).collect();
@@ -5772,7 +5947,7 @@ mod negative_controls {
         // means "nothing failed loudly enough, often enough, with a status",
         // and a reader who cannot see that will read it as "every route answers".
         let clean = mounted_routes_answer(
-            &[RouteOutcomeRow { method: "POST".into(), shape: "/api/workers/{id}/send".into(), n: 4368, ok: 4006, client_err: 300, server_err: 62, unavailable: 0 }],
+            &[RouteOutcomeRow { method: "POST".into(), shape: "/api/workers/{id}/send".into(), n: 4368, ok: 4006, client_err: 300, server_err: 62, unavailable: 0, ..Default::default() }],
             &mounted,
         );
         assert_eq!(clean.len(), 1);
@@ -5782,11 +5957,15 @@ mod negative_controls {
         assert_eq!(ev["n_considered"], 1, "a zero finding is only readable beside its population");
         // The COUNT is pinned on purpose, so growing the list is a decision
         // somebody makes rather than a line that slips in. It grew to 5 when the
-        // refusal-shaped spot was added, and to 6 for the optional-daemon 503
-        // (AMUX-4545); this assertion is what made each one visible instead of
-        // silent, and it caught the sixth on the first run.
-        assert_eq!(ev["blind_spots"].as_array().map(|a| a.len()), Some(6),
-                   "all six blind spots ship with every result");
+        // refusal-shaped spot was added, to 6 for the optional-daemon 503
+        // (AMUX-4545), and to 7 for the window's inability to self-heal
+        // (AMUX-4753); this assertion is what made each one visible instead of
+        // silent, and it caught the sixth and the seventh on the first run.
+        assert_eq!(ev["blind_spots"].as_array().map(|a| a.len()), Some(7),
+                   "all seven blind spots ship with every result");
+        assert!(ev["blind_spots"].to_string().contains("DOES NOT SELF-HEAL"),
+                "a reader deciding whether a finding is live needs to be told the window \
+                 holds an old burst");
         assert!(ev["blind_spots"].to_string().contains("error body"),
                 "the status-only blind spot is the one most likely to be forgotten");
         assert!(ev["blind_spots"].to_string().contains("CORRECT answer is a refusal"),

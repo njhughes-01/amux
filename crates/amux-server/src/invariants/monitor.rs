@@ -109,6 +109,25 @@ pub fn last_section_timing() -> Option<SectionTiming> {
     SECTION_MS.get_or_init(Default::default).lock().ok().and_then(|g| g.clone())
 }
 
+/// Fold two recency readings into the NEWEST (AMUX-4753).
+///
+/// SQL groups by raw path and Rust folds those into a route shape, so one shape
+/// accumulates a `MAX(ts)` from each of its paths. Newest has to win: taking the
+/// oldest, or letting the last row seen overwrite, reports a shape as stale
+/// while one of its paths was called a minute ago — and stale is exactly what a
+/// reader now uses to decide whether a finding is live.
+///
+/// Extracted rather than inlined because it was not testable inlined. Written
+/// inline first, it survived a mutation from `max` to `min` with the whole suite
+/// green, which is a rule nothing tested.
+fn newest(current: Option<f64>, incoming: Option<f64>) -> Option<f64> {
+    match (current, incoming) {
+        (Some(a), Some(b)) => Some(a.max(b)),
+        (Some(a), None) => Some(a),
+        (None, b) => b,
+    }
+}
+
 pub async fn evaluate_all(state: &AppState) -> Vec<InvariantResult> {
     let mut out = Vec::new();
     let mut tm = SectionTimer::new();
@@ -152,9 +171,13 @@ pub async fn evaluate_all(state: &AppState) -> Vec<InvariantResult> {
             struct Acc {
                 ok: i64,
                 n: i64,
+                redirect: i64,
                 client_err: i64,
                 server_err: i64,
                 unavailable: i64,
+                /// Newest `ts` in the group, so a finding can say how old it is
+                /// (AMUX-4753). `None` until a row contributes one.
+                last_seen: Option<f64>,
             }
             let mut acc: std::collections::HashMap<(String, String), Acc> =
                 std::collections::HashMap::new();
@@ -162,6 +185,10 @@ pub async fn evaluate_all(state: &AppState) -> Vec<InvariantResult> {
             // the only status a handler picks to say "something I depend on is
             // not there" and `status >= 500` cannot be un-mixed afterwards
             // (AMUX-4545).
+            // 3xx is summed too (AMUX-4753): a redirect is the route ANSWERING,
+            // and `ok` alone cannot say so. MAX(ts) rides along so a finding can
+            // publish how old it is — without it a burst early in this 14-day
+            // window is indistinguishable from a route failing right now.
             let rows = conn
                 .prepare(
                     "SELECT method, path, \
@@ -169,7 +196,9 @@ pub async fn evaluate_all(state: &AppState) -> Vec<InvariantResult> {
                             COUNT(*), \
                             SUM(CASE WHEN status >= 400 AND status < 500 THEN 1 ELSE 0 END), \
                             SUM(CASE WHEN status >= 500 THEN 1 ELSE 0 END), \
-                            SUM(CASE WHEN status = 503 THEN 1 ELSE 0 END) \
+                            SUM(CASE WHEN status = 503 THEN 1 ELSE 0 END), \
+                            SUM(CASE WHEN status >= 300 AND status < 400 THEN 1 ELSE 0 END), \
+                            MAX(ts) \
                      FROM _amux_request_log WHERE ts >= ?1 GROUP BY method, path",
                 )
                 .and_then(|mut stmt| {
@@ -182,19 +211,23 @@ pub async fn evaluate_all(state: &AppState) -> Vec<InvariantResult> {
                             r.get::<_, i64>(4)?,
                             r.get::<_, i64>(5)?,
                             r.get::<_, i64>(6)?,
+                            r.get::<_, i64>(7)?,
+                            r.get::<_, Option<f64>>(8)?,
                         ))
                     })
                     .and_then(|rows| rows.collect::<Result<Vec<_>, _>>())
                 })
                 .unwrap_or_default();
-            for (method, path, ok, n, c4, c5, c503) in rows {
+            for (method, path, ok, n, c4, c5, c503, c3, last) in rows {
                 let shape = crate::api::request_log::normalize_target_verb(&path);
                 let e = acc.entry((method, shape)).or_default();
                 e.ok += ok;
                 e.n += n;
+                e.redirect += c3;
                 e.client_err += c4;
                 e.server_err += c5;
                 e.unavailable += c503;
+                e.last_seen = newest(e.last_seen, last);
             }
             let groups: Vec<checks::RouteOutcomeRow> = acc
                 .into_iter()
@@ -203,9 +236,11 @@ pub async fn evaluate_all(state: &AppState) -> Vec<InvariantResult> {
                     shape,
                     n: a.n,
                     ok: a.ok,
+                    redirect: a.redirect,
                     client_err: a.client_err,
                     server_err: a.server_err,
                     unavailable: a.unavailable,
+                    last_seen: a.last_seen,
                 })
                 .collect();
             out.extend(checks::mounted_routes_answer(&groups, &mounted));
@@ -2798,6 +2833,27 @@ async fn one_pass(state: &AppState) -> bool {
 
 #[cfg(test)]
 mod tests {
+
+    /// AMUX-4753. One route shape accumulates a `MAX(ts)` from each raw path
+    /// that folds into it, and the fold has to keep the NEWEST.
+    ///
+    /// This cell exists because the rule was untestable where it was written:
+    /// inline in `evaluate_all`, a mutation from `max` to `min` left the entire
+    /// suite green. Order-independence is the half that matters — a fold that
+    /// only works when the newest row happens to arrive last is a bug that
+    /// reproduces on someone else's data.
+    #[test]
+    fn folding_recency_keeps_the_newest_reading_in_either_order() {
+        use super::newest;
+        let (old, new) = (1_000.0, 2_000.0);
+        assert_eq!(newest(Some(old), Some(new)), Some(new), "newest arriving last");
+        assert_eq!(newest(Some(new), Some(old)), Some(new), "newest arriving first");
+        // ABSENCE IS NOT ZERO. A path with no timestamp must not drag a shape's
+        // recency back to the epoch, and it must not erase one already known.
+        assert_eq!(newest(Some(new), None), Some(new), "an unmeasured row erases nothing");
+        assert_eq!(newest(None, Some(old)), Some(old), "the first reading is adopted");
+        assert_eq!(newest(None, None), None, "nothing measured stays nothing measured");
+    }
 
     /// AMUX-4734: the tick BOOKENDS the pass, and only a completed pass ticks.
     ///
