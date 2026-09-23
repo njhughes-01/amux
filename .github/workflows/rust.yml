@@ -94,6 +94,10 @@ jobs:
       # carrying the exact bug the control existed to catch (7ca3f68).
       - name: Tree-residue guard — self-test (negative control)
         run: bash scripts/test-tree-clean.sh --self-test
+      # The shard-accounting check `check` runs must be seen to fail on a
+      # missing shard, a missing, a duplicated and an unlisted test.
+      - name: nextest shard accounting — self-test (negative control)
+        run: python3 scripts/check-nextest-shards.py --self-test
       # Wrapped, not run-after, so the guard cannot drift away from what it
       # guards. Exit codes (7ca3f68): 0 clean · 3 command SUCCEEDED but left
       # residue · anything else is the command's own rc, which always wins.
@@ -243,6 +247,9 @@ jobs:
         run: |
           mkdir -p "$RUNNER_TEMP/nextest"
           cargo nextest archive --workspace --archive-file "$RUNNER_TEMP/nextest/archive.tar.zst"
+      # The population the shards must add up to (read by `check`).
+      - name: List every test
+        run: cargo nextest list --workspace --message-format json > "$RUNNER_TEMP/nextest/list.json"
       - uses: actions/upload-artifact@v4
         with:
           name: nextest-archive
@@ -250,6 +257,12 @@ jobs:
           if-no-files-found: error
           compression-level: 0
           retention-days: 1
+      - uses: actions/upload-artifact@v4
+        with:
+          name: nextest-list
+          path: ${{ runner.temp }}/nextest/list.json
+          if-no-files-found: error
+          retention-days: 7
 
   test-shards:
     needs: test-build
@@ -308,7 +321,19 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
+      - uses: actions/checkout@v4
+      # One directory per artifact (no merge-multiple): every shard's file is
+      # named junit.xml, and merging would overwrite them down to one.
+      - uses: actions/download-artifact@v4
+        with: { pattern: nextest-junit-*, path: ci-junit }
+      - uses: actions/download-artifact@v4
+        with: { name: nextest-list, path: ci-list }
+      # Green shards prove only what they ran. This proves listed == executed,
+      # by (binary, test) identity, so a mis-partition cannot pass.
+      - name: Account for every test across the shards
+        run: python3 scripts/check-nextest-shards.py ci-junit ci-list/list.json "$NEXTEST_SHARDS"
       - name: Require lint, test-build and every shard to succeed
+        if: ${{ !cancelled() }}
         env:
           RESULTS: ${{ needs.lint.result }} ${{ needs.test-build.result }} ${{ needs.test-shards.result }}
         run: |
