@@ -154,6 +154,13 @@ pub async fn export(State(state): State<AppState>) -> (StatusCode, Json<Value>) 
 
 /// Apply a config document. Reports per-item `changed` vs `unchanged` so a
 /// second run visibly does nothing.
+/// A session env file body in the one format every env reader agrees on (see
+/// `crate::config::env_assignment`). Unquoted `K=v` baked EnvFile's escapes into the
+/// value on every apply.
+fn render_env_file(env: &std::collections::BTreeMap<String, String>) -> String {
+    env.iter().map(|(k, v)| crate::config::env_assignment(k, v)).collect()
+}
+
 pub async fn apply(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -337,7 +344,7 @@ pub async fn apply(
                 unchanged.push(tag);
                 continue;
             }
-            let body: String = env.iter().map(|(k, v)| format!("{k}={v}\n")).collect();
+            let body = render_env_file(&env);
             if let Some(p) = f.parent() {
                 let _ = std::fs::create_dir_all(p);
             }
@@ -360,4 +367,33 @@ pub async fn apply(
             "summary": format!("{} changed, {} already matched", changed.len(), unchanged.len()),
         })),
     )
+}
+
+#[cfg(test)]
+mod env_render_tests {
+    #[test]
+    fn a_rendered_worker_env_reads_back_unchanged() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("w.env");
+        let marker = dir.path().join("SHOULD_NOT_EXIST");
+        let tricky = format!(r#"--append-system-prompt "x" $(touch {}) `z` \d"#, marker.display());
+        let mut env = std::collections::BTreeMap::new();
+        env.insert("CC_FLAGS".to_string(), tricky.clone());
+        env.insert("CC_TAGS".to_string(), "a,b".to_string());
+        std::fs::write(&p, super::render_env_file(&env)).unwrap();
+        let first = crate::config::parse_env_file(&p);
+        assert_eq!(first, env);
+        // Apply is re-run on the file it wrote; nothing may accumulate.
+        std::fs::write(&p, super::render_env_file(&first)).unwrap();
+        assert_eq!(crate::config::parse_env_file(&p), env);
+        // The file is SOURCED by lane shells: the value must come back intact
+        // and nothing in it may run.
+        let out = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(format!(". {}; printf %s \"$CC_FLAGS\"", p.display()))
+            .output()
+            .unwrap();
+        assert!(!marker.exists(), "sourcing a config-applied env file EXECUTED the value");
+        assert_eq!(String::from_utf8_lossy(&out.stdout), tricky);
+    }
 }

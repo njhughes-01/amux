@@ -221,64 +221,6 @@ impl EnvFile {
         self.pairs.iter().map(|(k, _)| k.clone()).collect()
     }
 
-/// Escape a value for a DOUBLE-QUOTED shell assignment.
-///
-/// THIS FILE IS SOURCED. Before this existed, `write_unlocked` emitted
-/// `K="<raw value>"` with no escaping at all, so:
-///
-///   * a value containing `$(...)` or a backtick EXECUTED on every source. Observed
-///     2026-09-20 on a CC_WORKTREE_VERIFY value, which ran `git rev-parse` and
-///     printed `graft_inflight_order_key: command not found` from a shell that was
-///     only meant to read variables.
-///   * a value containing a bare `"` ended the string early and turned the remainder
-///     of the line into commands. That is why CC_ACCEPTANCE_CRITERIA, which stores a
-///     JSON array of quoted strings, breaks `amux info` with `search: command not
-///     found`.
-///
-/// The four characters that keep their meaning inside double quotes are `\`, `"`,
-/// `$` and a backtick, so those are exactly the four escaped here.
-///
-/// NEWLINES ARE DELIBERATELY LEFT ALONE. A literal newline inside double quotes is
-/// valid shell and survives `source`, so escaping it would change the value a
-/// consumer sees. `load` is line-based and will not round-trip one, which is a
-/// pre-existing limit this change neither fixes nor worsens.
-fn env_quote(v: &str) -> String {
-    let mut out = String::with_capacity(v.len() + 8);
-    for c in v.chars() {
-        if matches!(c, '\\' | '"' | '$' | '`') {
-            out.push('\\');
-        }
-        out.push(c);
-    }
-    out
-}
-
-/// Reverse `env_quote`.
-///
-/// Only the four sequences `env_quote` can emit are consumed; any other backslash is
-/// left exactly as it was. That matters for BACKWARD COMPATIBILITY: 154 session env
-/// files existed when this landed, written by the unescaped writer, and none of them
-/// contained a backslash at all, so no stored value changes meaning. A legacy value
-/// that did contain one keeps it unless it happens to precede one of the four.
-fn env_unquote(v: &str) -> String {
-    let mut out = String::with_capacity(v.len());
-    let mut chars = v.chars().peekable();
-    while let Some(c) = chars.next() {
-        if c == '\\' {
-            match chars.peek() {
-                Some(&n) if matches!(n, '\\' | '"' | '$' | '`') => {
-                    out.push(n);
-                    chars.next();
-                }
-                _ => out.push(c),
-            }
-        } else {
-            out.push(c);
-        }
-    }
-    out
-}
-
     pub(crate) fn load(path: &Path) -> Self {
         let mut pairs = Vec::new();
         let Ok(text) = std::fs::read_to_string(path) else {
@@ -306,7 +248,7 @@ fn env_unquote(v: &str) -> String {
             // in shell do not take escapes at all, so unescaping one would corrupt it.
             let owned;
             let v = if was_double_quoted {
-                owned = Self::env_unquote(v);
+                owned = crate::config::env_unquote(v);
                 owned.as_str()
             } else {
                 v
@@ -356,7 +298,7 @@ fn env_unquote(v: &str) -> String {
         use std::io::Write as _;
         let mut out = format!("# updated: {}\n", chrono::Local::now().format("%Y-%m-%dT%H:%M:%S%.6f"));
         for (k, v) in &self.pairs {
-            out.push_str(&format!("{k}=\"{}\"\n", Self::env_quote(v)));
+            out.push_str(&crate::config::env_assignment(k, v));
         }
         if let Some(dir) = path.parent() {
             std::fs::create_dir_all(dir)?;
@@ -412,7 +354,7 @@ fn env_unquote(v: &str) -> String {
                 }
             }
         }
-        let text: String = current.iter().map(|(key, value)| format!("{key}={value}\n")).collect();
+        let text: String = current.iter().map(|(key, value)| crate::config::env_assignment(key, value)).collect();
         use std::io::Write as _;
         if let Some(dir) = path.parent() { std::fs::create_dir_all(dir)?; }
         let tmp = unique_tmp_path(path);
@@ -26429,6 +26371,42 @@ mod tests {
     }
 
     #[test]
+    fn every_env_writer_and_reader_agrees_on_an_escaped_value() {
+        // Escaping in EnvFile alone split the file format: the worker-scope merge
+        // and config-as-code apply read with parse_env_file (no unescape) and wrote
+        // `K=v` unquoted, so a merge baked the escape backslashes into the value and
+        // every later EnvFile write doubled them.
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("x.env");
+        let marker = dir.path().join("SHOULD_NOT_EXIST");
+        let payload = format!(r#"["a \"b\"", "c\d"] $(touch {}) `x`"#, marker.display());
+
+        let mut e = EnvFile::default();
+        e.set("CC_TEST", &payload);
+        e.write(&p).unwrap();
+        assert_eq!(crate::config::parse_env_file(&p).get("CC_TEST"), Some(&payload));
+
+        EnvFile::merge_plain(&p, &[("CC_OTHER".into(), Some("y".into()))]).unwrap();
+        EnvFile::merge_plain(&p, &[("CC_OTHER".into(), None)]).unwrap();
+        assert_eq!(EnvFile::load(&p).get("CC_TEST"), Some(payload.as_str()));
+        assert_eq!(crate::config::parse_env_file(&p).get("CC_TEST"), Some(&payload));
+
+        let out = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(format!(". {}; printf %s \"$CC_TEST\"", p.display()))
+            .output()
+            .unwrap();
+        assert!(!marker.exists(), "sourcing a merged env file EXECUTED the value");
+        assert_eq!(String::from_utf8_lossy(&out.stdout), payload);
+
+        // A second EnvFile round trip must not add backslashes.
+        let mut again = EnvFile::load(&p);
+        again.set("CC_THIRD", "z");
+        again.write(&p).unwrap();
+        assert_eq!(EnvFile::load(&p).get("CC_TEST"), Some(payload.as_str()));
+    }
+
+    #[test]
     fn a_value_containing_double_quotes_survives_a_source_and_a_reload() {
         // The CC_ACCEPTANCE_CRITERIA shape: a JSON array of quoted strings. Unescaped,
         // the first inner quote ended the assignment and the rest of the line became
@@ -30545,8 +30523,9 @@ mod submission_gate_tests {
         struct Pane(String);
         impl Drop for Pane {
             fn drop(&mut self) {
+                let st = session_target(&self.0);
                 let _ = std::process::Command::new("tmux")
-                    .args(["kill-session", "-t", &session_target(&self.0)]).output();
+                    .args(["kill-session", "-t", &st]).output();
             }
         }
         let dir = tempfile::tempdir().unwrap();
