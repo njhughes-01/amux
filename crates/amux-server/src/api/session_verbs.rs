@@ -1070,10 +1070,35 @@ fn trim_live_overlap(transcript: &str, live: &str) -> String {
         false
     };
     let ll: Vec<&str> = live.split('\n').collect();
-    let matches: Vec<usize> =
-        ll.iter().enumerate().filter(|(_, x)| in_transcript(&norm(x))).map(|(i, _)| i).collect();
-    if matches.len() >= 3 {
-        let after = matches[matches.len() - 1] + 1;
+    // SCAN FROM THE END (AMUX-4802/peek latency). This used to normalise and
+    // test EVERY live line, then use exactly two things: the count is at least
+    // three, and the LAST matching index. Both are answerable from the tail, so
+    // stop after the third match instead of walking the whole capture.
+    //
+    // It matters because `in_transcript` is O(transcript) per line: for lines
+    // of 24+ chars it scans every long transcript line doing containment in
+    // both directions. Measured on the live server with a 600-line peek, which
+    // is the shape CLAUDE.md tells every worker to use: 113.8ms with the trim
+    // against 50.6ms with `notrim=1`, so the trim was 55% of the request. At
+    // lines=5000 it was 688ms against 90ms, or 87%.
+    //
+    // Exactly equivalent, not an approximation: `found[0]` is the first match
+    // seen while descending, which is the maximum index, which is the old
+    // `matches[matches.len() - 1]`. And finding three while descending is the
+    // same predicate as the old `matches.len() >= 3`. When fewer than three
+    // exist this walks the whole capture exactly as before and falls through to
+    // the prompt-anchor path below.
+    let mut found: Vec<usize> = Vec::with_capacity(3);
+    for (i, x) in ll.iter().enumerate().rev() {
+        if in_transcript(&norm(x)) {
+            found.push(i);
+            if found.len() == 3 {
+                break;
+            }
+        }
+    }
+    if found.len() >= 3 {
+        let after = found[0] + 1;
         return ll[after.min(ll.len())..].join("\n").trim_start_matches('\n').to_string();
     }
 
@@ -2546,7 +2571,56 @@ pub(crate) fn sweep_transcript_evidence() -> usize {
     }).unwrap_or(0)
 }
 
+/// One WARN per non-claude session per PROCESS, so a residual foreign pointer
+/// announces itself without a per-poll log flood. The builder restarts this
+/// binary on every commit, so the set clears and the condition re-announces
+/// rather than being reported once in the life of the box.
+fn foreign_transcript_seen() -> &'static std::sync::Mutex<std::collections::HashSet<String>> {
+    static S: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<String>>> = std::sync::OnceLock::new();
+    S.get_or_init(Default::default)
+}
+
+/// The signal the two-fixes rule owes the AMUX-4788 gate.
+///
+/// Same shape as the `--model`-in-CC_FLAGS WARN in the ollama launch arm: it
+/// fires when amux is COMPENSATING for a mis-wire, so the condition is findable
+/// by a `/api/logs` sweep instead of waiting for someone to read a meta file. It
+/// only fires when a claude transcript really does resolve for this worker; a
+/// non-claude lane that was never claude is silent, which is what makes a line
+/// here mean something.
+fn warn_foreign_transcript_once(name: &str, provider: &str) {
+    let Ok(mut seen) = foreign_transcript_seen().lock() else { return };
+    let first = seen.insert(name.to_string());
+    // Released before the path lookup below, which touches the filesystem.
+    drop(seen);
+    if !first {
+        return;
+    }
+    if let Some(p) = session_jsonl_path(name) {
+        tracing::warn!(
+            session = %name,
+            provider = %provider,
+            launch_binary = %launch_base_binary(provider),
+            transcript = %p.display(),
+            "non-claude worker still resolves to a Claude Code transcript; its model and token counts are not this worker's and are being refused (AMUX-4788)"
+        );
+    }
+}
+
 pub(crate) fn transcript_evidence(name: &str) -> (Option<String>, Option<u64>) {
+    // BEFORE the cache and before any IO, because this function parses one
+    // vendor's file format and a worker that does not write it has no evidence
+    // here to read (AMUX-4788, `writes_claude_transcript`). The honest empty is
+    // the answer; the previous answer was another provider's model.
+    //
+    // Returning early also skips `session_jsonl_path`, whose last resort scans
+    // the project dir AND every sibling's meta — real work, done per poll, to
+    // produce a value that could only ever be wrong for these providers.
+    let provider = provider_of(&parse_env(name));
+    if !writes_claude_transcript(&provider) {
+        warn_foreign_transcript_once(name, &provider);
+        return (None, None);
+    }
     let ttl = transcript_evidence_ttl();
     let now = now_f64();
     let cache = transcript_evidence_cache();
@@ -4003,6 +4077,28 @@ pub fn launch_base_binary(provider: &str) -> &'static str {
         // whose default binary is `claude` (overridable by AMUX_CLAUDE_CMD).
         _ => "claude",
     }
+}
+
+/// Does this provider WRITE the Claude Code transcript that
+/// [`transcript_evidence`] parses?
+///
+/// DERIVED from [`launch_base_binary`] rather than restated as a second list,
+/// because the two answer the same question. `~/.claude/projects/*/<id>.jsonl`
+/// is written by the `claude` CLI and by nothing else, so the provider whose
+/// launch binary is `claude` is exactly the provider whose transcript that is.
+/// A provider added to the launch match tomorrow gets the right answer here
+/// with no second edit, which a parallel list could not promise.
+///
+/// AMUX-4788. The fallback had no provider test at all, so an ollama worker
+/// answered `active_model: "claude-opus-5"` and 869,632 tokens out of its dead
+/// pre-switch claude conversation, which `restart_for_swap` had stamped into
+/// its meta and no swap ever cleared. Measured live on `desktop`, 2026-09-18.
+/// The exposure is not only a stale pointer: `session_jsonl_path`'s last resort
+/// is the single unclaimed conversation in the work dir, and ~/Dev/amux hosts
+/// many lanes, so a non-claude worker could be handed a NEIGHBOUR's transcript
+/// it never had any relationship to.
+fn writes_claude_transcript(provider: &str) -> bool {
+    launch_base_binary(provider) == "claude"
 }
 
 fn provider_label(provider: &str) -> &str {
@@ -26857,6 +26953,40 @@ CLAUDE-POSTFIX-COMPLETE
                    "fresh after prompt");
     }
 
+    /// The overlap scan runs from the END and stops after three matches, which
+    /// is only equivalent to the old whole-capture scan if it keeps the
+    /// HIGHEST matching index rather than the third-from-last one.
+    ///
+    /// The old code collected every match and used `matches[len - 1]`. Reading
+    /// the wrong end of the early-exit buffer is the natural way to get this
+    /// wrong, and it is invisible in a capture where the last three overlapping
+    /// lines happen to be adjacent. So this fixture puts a GAP between the
+    /// third-from-last match and the last one: taking the wrong end would
+    /// re-emit `carried over from the transcript`, which the reader has already
+    /// seen, and that duplication is the exact symptom the trim exists to stop.
+    #[test]
+    fn the_overlap_scan_keeps_the_last_match_not_the_third_from_last() {
+        let shared: Vec<String> = (0..6)
+            .map(|i| format!("a shared transcript line number {i} long enough to anchor"))
+            .collect();
+        let transcript = format!(
+            "{}\ncarried over from the transcript and also long enough to anchor",
+            shared.join("\n")
+        );
+        // Three early matches, a gap of genuinely new text, then one more
+        // match, then the tail the caller should actually receive.
+        let live = format!(
+            "{}\n{}\n{}\nbrand new output line one\nbrand new output line two\n{}\nthe only fresh tail",
+            shared[0], shared[1], shared[2],
+            "carried over from the transcript and also long enough to anchor",
+        );
+        assert_eq!(
+            trim_live_overlap(&transcript, &live),
+            "the only fresh tail",
+            "must trim after the LAST overlapping line, not the third-from-last"
+        );
+    }
+
     #[test]
     fn transcript_md_render_basics() {
         let out = md_to_ansi("# Head\n**bold** and `code`");
@@ -26903,6 +27033,81 @@ CLAUDE-POSTFIX-COMPLETE
         let conn = state.store.read().unwrap();
         assert_eq!(conn.query_row("SELECT COUNT(*) FROM send_dedup",[],|r|r.get::<_,i64>(0)).unwrap(),1);
         assert_eq!(conn.query_row("SELECT COUNT(*) FROM cmd_history",[],|r|r.get::<_,i64>(0)).unwrap(),0);
+    }
+
+    /// AMUX-4788: transcript evidence belongs only to the worker that WROTE
+    /// the transcript.
+    ///
+    /// Both halves matter and they fail differently. The MODEL half is a wrong
+    /// badge. The TOKEN half is the expensive one: `session_report` takes
+    /// `transcript_evidence(name).1` as its context-size fallback, and the
+    /// comment above that call says a wrong count there produces a forced
+    /// compaction of a healthy lane rather than a wrong badge. Gating inside
+    /// `transcript_evidence` is what makes ONE cell here cover both consumers;
+    /// gating at the two call sites would leave the third one somebody adds.
+    #[test]
+    fn transcript_evidence_belongs_only_to_the_provider_that_wrote_it() {
+        // The predicate is DERIVED from the launch binary, so these cells are
+        // about the derivation, not a list. iterm2 is the one worth stating:
+        // it has no arm in the launch match and falls to build_claude_cmd, so
+        // it DOES write a claude transcript and must keep the fallback.
+        for p in ["claude", "iterm2", "", "something-unknown"] {
+            assert!(writes_claude_transcript(p), "{p} launches {}", launch_base_binary(p));
+        }
+        for p in ["ollama", "codex", "gemini"] {
+            assert!(!writes_claude_transcript(p), "{p} launches {}", launch_base_binary(p));
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let _home = crate::api::settings::test_env::set_home(dir.path());
+        // claude_home() reads HOME; the guard restores the whole environment.
+        std::env::set_var("HOME", dir.path());
+        std::fs::create_dir_all(sessions_dir()).unwrap();
+        let wd = dir.path().join("work");
+        std::fs::create_dir_all(&wd).unwrap();
+        let project = claude_home().join("projects").join(project_name(&wd.to_string_lossy()));
+        std::fs::create_dir_all(&project).unwrap();
+
+        // ONE transcript, TWO workers pointed at it by meta. Same bytes on both
+        // sides, so the only thing that can separate the results is the
+        // provider — which is the whole claim.
+        let conv = "0000ae57-4788-4788-4788-000000004788";
+        std::fs::write(
+            project.join(format!("{conv}.jsonl")),
+            format!(
+                "{}\n",
+                json!({"message": {"model": "claude-opus-5", "usage": {"input_tokens": 800_000, "cache_read_input_tokens": 69_632, "output_tokens": 0}}}),
+            ),
+        )
+        .unwrap();
+        let wire = |name: &str, provider_line: &str| {
+            std::fs::write(env_path(name), format!("CC_DIR={}\n{provider_line}", wd.display())).unwrap();
+            std::fs::write(
+                meta_path(name),
+                json!({"cc_conversation_id": conv, "cc_cwd": wd.to_string_lossy()}).to_string(),
+            )
+            .unwrap();
+        };
+        // The live shape from `desktop`: swapped to ollama, and the claude
+        // conversation id restart_for_swap stamped is still in its meta because
+        // no swap clears it.
+        wire("t4788-olla", "CC_PROVIDER=ollama\n");
+        wire("t4788-clod", "");
+
+        assert_eq!(
+            transcript_evidence("t4788-olla"),
+            (None, None),
+            "an ollama worker must take neither a model nor a token count from a claude transcript"
+        );
+        // POSITIVE CONTROL, and it is the cell that keeps this from being a
+        // deletion: the fallback exists to fill a real gap (lanes whose hook
+        // predates the reporting change), so a claude worker must still get it
+        // from the very same file.
+        assert_eq!(
+            transcript_evidence("t4788-clod"),
+            (Some("claude-opus-5".into()), Some(869_632)),
+            "a claude worker still reads its own transcript"
+        );
     }
 
     /// AMUX-4594. A reservation no live send owns resolves from the transcript:
