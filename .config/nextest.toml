@@ -1,0 +1,27 @@
+# cargo-nextest configuration. CI (.github/workflows/rust.yml) runs the PR
+# gate's Rust tests from ONE prebuilt archive split across shard jobs.
+#
+# The pin is the version CI installs (taiki-e/install-action in rust.yml).
+# Bump both together; an older local nextest refuses to run with this file.
+nextest-version = { required = "0.9.145" }
+
+# The default profile is left alone for local use.
+
+[profile.ci]
+# Report EVERY failure, not the first.
+fail-fast = false
+# No retries, deliberately: a flaky test stays red. Retrying until green
+# would hide exactly the intermittent failures the suite exists to find.
+retries = 0
+# One warning per minute; kill a hung test after 10 minutes. The slowest
+# test today (request_log over_cap_stats...) takes 1-2.5 min in debug.
+slow-timeout = { period = "60s", terminate-after = 10 }
+failure-output = "immediate-final"
+success-output = "never"
+status-level = "fail"
+final-status-level = "slow"
+
+[profile.ci.junit]
+# Written to target/nextest/ci/junit.xml. Each shard uploads it under its own
+# artifact name; the aggregate job counts the testcases across all of them.
+path = "junit.xml"
