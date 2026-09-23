@@ -179,11 +179,13 @@ impl FleetCircuitBreaker {
 
     /// Whether an emergency state may close on this observation.
     ///
-    /// A no-progress or all-blocked trip cannot require a completion before
-    /// recovery: while open, the planner deliberately makes no assignments,
-    /// so that requirement would deadlock the fleet. Runnable work returning
-    /// is enough to permit one probe assignment. Spend/error trips still wait
-    /// for their measured window to clear, and a manual stop never auto-closes.
+    /// Recovery cannot require a completion: while open, the planner
+    /// deliberately makes no assignments, so an idle window with live work
+    /// always reads as `NoProgress`, and demanding `evaluate() == None` held a
+    /// cleared spend trip open forever (Spinx, 2026-09-22). So any trip may
+    /// close once the window judges `None` or `NoProgress` — `evaluate` checks
+    /// no-progress last, so `Some(NoProgress)` already means spend, blocking
+    /// and errors are all clear. A manual stop never auto-closes.
     pub fn can_recover(&self, state: &FleetState, window: &WindowStats) -> bool {
         match state {
             FleetState::Normal => false,
@@ -191,16 +193,10 @@ impl FleetCircuitBreaker {
                 reason: CircuitOpenReason::ManualStop,
                 ..
             } => false,
-            FleetState::CircuitOpen {
-                reason: CircuitOpenReason::AllItemsBlocked | CircuitOpenReason::NoProgress { .. },
-                ..
-            } if window.has_live_work && !window.all_items_blocked => matches!(
+            FleetState::CircuitOpen { .. } | FleetState::Reconciling { .. } => matches!(
                 self.evaluate(window),
                 None | Some(CircuitOpenReason::NoProgress { .. })
             ),
-            FleetState::CircuitOpen { .. } | FleetState::Reconciling { .. } => {
-                self.evaluate(window).is_none()
-            }
         }
     }
 }
@@ -423,6 +419,53 @@ mod tests {
         let manual = FleetState::open(CircuitOpenReason::ManualStop, t0());
         assert!(!breaker().can_recover(&manual, &healthy()));
         assert!(!breaker().can_recover(&FleetState::Normal, &healthy()));
+    }
+
+    #[test]
+    fn measured_breakers_recover_once_cleared_even_while_progress_is_halted() {
+        // Assignments are halted while open, so an idle window with live
+        // work always reads as NoProgress. Requiring evaluate()==None here
+        // held a cleared spend trip open forever (Spinx, 2026-09-22).
+        let mut halted = healthy();
+        halted.tokens_spent = 0;
+        halted.failures = 0;
+        halted.tasks_completed = 0;
+        assert_eq!(
+            breaker().evaluate(&halted),
+            Some(CircuitOpenReason::NoProgress { window_secs: 14_400 })
+        );
+
+        let spend_open = FleetState::open(
+            CircuitOpenReason::SpendRateExceeded {
+                window_tokens: 2_000,
+                budget: breaker().window_budget_tokens,
+            },
+            t0(),
+        );
+        let error_open = FleetState::open(
+            CircuitOpenReason::ErrorRateExceeded {
+                failures: 5,
+                window_secs: breaker().window_secs,
+            },
+            t0(),
+        );
+        let reconciling = FleetState::Reconciling { since: t0() };
+        for state in [&spend_open, &error_open, &reconciling] {
+            assert!(breaker().can_recover(state, &halted), "{state:?}");
+        }
+
+        // Still-live measured trips keep the circuit open.
+        let mut costly = halted;
+        costly.tokens_spent = breaker().window_budget_tokens;
+        let mut failing = halted;
+        failing.failures = breaker().max_failures_per_window;
+        let mut blocked = halted;
+        blocked.all_items_blocked = true;
+        for state in [&spend_open, &error_open, &reconciling] {
+            for window in [&costly, &failing, &blocked] {
+                assert!(!breaker().can_recover(state, window), "{state:?} {window:?}");
+            }
+        }
     }
 
     #[test]

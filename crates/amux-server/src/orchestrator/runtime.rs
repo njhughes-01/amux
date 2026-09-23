@@ -380,15 +380,25 @@ impl Runtime {
                     }
                 }
                 _ => {
-                    // Open/reconciling: measured breakers wait for their
-                    // window to clear. Structural/no-progress breakers may
-                    // admit one probe when runnable work reappears; requiring
-                    // a completion while assignments are halted deadlocks.
+                    // Open/reconciling: any non-manual trip closes once
+                    // spend, errors and all-blocked are clear. No-progress
+                    // cannot hold it: assignments are halted while open, so
+                    // requiring a completion would deadlock.
                     if self.breaker.can_recover(&fs, &window) {
                         if let Some(closed) = fs.close() {
                             tracing::info!("fleet circuit CLOSED (window healthy)");
                             next = Some(closed);
                         }
+                    } else if heartbeat {
+                        // A breaker that can never close is silent otherwise:
+                        // one spend trip sat open for 10 h with a clear
+                        // window before anyone read _amux_fleet_state.
+                        tracing::warn!(
+                            state = ?*fs,
+                            holding = ?self.breaker.evaluate(&window),
+                            window = ?window,
+                            "fleet circuit held open"
+                        );
                     }
                 }
             }
