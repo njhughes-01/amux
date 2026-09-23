@@ -1434,7 +1434,16 @@ fn self_reports_check(state: &AppState) -> Vec<InvariantResult> {
                 .get(n)
                 .and_then(|r| r["ts"].as_f64())
                 .map(|ts| signals.now - ts);
-            checks::LaneReport { name: n.to_string(), report_age_s: age }
+            // AMUX-4917: what the last report SAID, not just when it landed.
+            // Read from the same row `age` comes from, so the two cannot
+            // describe different reports.
+            let last_state = signals
+                .reports
+                .get(n)
+                .and_then(|r| r["state"].as_str())
+                .unwrap_or("")
+                .to_string();
+            checks::LaneReport { name: n.to_string(), report_age_s: age, last_state }
         })
         .collect();
     // Policy in config, not baked in (ethos D4). Defaults: a fleet of >=10 lanes
@@ -2333,6 +2342,20 @@ async fn steering_queue_check(state: &AppState) -> Vec<InvariantResult> {
         let block_reason = crate::api::session_verbs::lane_block_reason(&session)
             .await
             .map(str::to_string);
+        // AF-219: the report's "active"/"idle" split cannot name "waiting on a
+        // human at a selector" -- an active report has no staleness bound,
+        // since its only exit is the turn ending, and a turn blocked on a
+        // human never ends. Only worth the extra pane scrape in the one
+        // combination the report vocabulary cannot answer: routable
+        // (block_reason is None) and not self-reported idle. Every other row
+        // already has a decisive answer and does not pay this cost.
+        let selector_wait = if block_reason.is_none() && !idle {
+            let pane = crate::api::session_verbs::tmux_capture(&session, 12).await;
+            crate::api::session_verbs::detect_claude_status(&pane) == "waiting"
+                && !crate::api::session_verbs::is_rate_limit_menu(&pane)
+        } else {
+            false
+        };
         items.push(checks::QueuedItem {
             queue: "steering".into(),
             target: session,
@@ -2340,6 +2363,7 @@ async fn steering_queue_check(state: &AppState) -> Vec<InvariantResult> {
             target_idle: idle,
             block_reason,
             idle_since,
+            target_selector_wait: selector_wait,
         });
     }
 

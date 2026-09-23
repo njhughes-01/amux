@@ -1387,7 +1387,35 @@ pub fn queue_has_live_consumer(
                     );
                 }
             }
-            // A deep queue behind a BUSY worker (routable, not idle) is correct.
+            // A deep queue behind a BUSY worker (routable, not idle) is correct
+            // -- UNLESS the pane itself shows the lane parked at a selector
+            // (AF-219): the report says "active" because a turn blocked on a
+            // human never ends, so nothing here can tell "genuinely busy" from
+            // "waiting on a person" without the scrape. That is the missing
+            // state cell; this is the narrow fix (option 3 of 3 on the card),
+            // not a new report vocabulary cell (option 1, not built here).
+            None if it.target_selector_wait && age > stale_after_s => out.push(
+                InvariantResult::fail(
+                    ID,
+                    format!(
+                        "a queue behind a lane reporting 'active' drains within {stale_after_s:.0}s, \
+                         or the lane is genuinely busy"
+                    ),
+                    format!(
+                        "undelivered for {age:.0}s; the report says active but the pane shows the \
+                         lane parked at a selector, waiting on a HUMAN decision -- not a turn that \
+                         will end on its own"
+                    ),
+                )
+                .entity(&it.target)
+                .evidence(json!({
+                    "target": it.target, "queue": it.queue, "age_s": age,
+                    "class": "waiting-on-human",
+                    "incident": "AF-219: a lane parked on a human decision reads as an ordinary \
+                                 busy worker because 'active' reports have no staleness bound and \
+                                 no cell for 'waiting on a person'",
+                })),
+            ),
             None => out.push(InvariantResult::pass(ID).entity(&it.target)),
         }
     }
@@ -1414,6 +1442,18 @@ pub struct QueuedItem {
     /// because those are different clocks and only one of them matches what the
     /// check claims to test (AMUX-3572).
     pub idle_since: Option<f64>,
+    /// True when a live pane scrape shows the target parked at a selector
+    /// (AskUserQuestion, a menu — `detect_claude_status == "waiting"`, rate-limit
+    /// menus excluded since those already carry their own `block_reason`), taken
+    /// at the SAME moment as `target_idle`. Only meaningful when `block_reason`
+    /// is `None` and `target_idle` is false: that is the one combination the
+    /// report vocabulary cannot name (AF-219) — the report says "active" because
+    /// a turn blocked on a human never ends, so the Stop hook that would flip it
+    /// to idle never fires, and `active` has no staleness bound the way `idle`
+    /// does. Without this field a lane parked on a human decision reads as an
+    /// ordinary busy worker with a draining queue, and the sender is never told
+    /// their message is stuck.
+    pub target_selector_wait: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -1670,14 +1710,73 @@ pub fn self_reports_landing(
                              pre-cutover sessions carry — status is running blind on pane-scrape",
         }))];
     }
-    if freshest > max_freshest_s {
+    // AGE ALONE CANNOT TELL A QUIET FLEET FROM A DEAD HOOK (AMUX-4917), and
+    // for 166 evaluations this read one as the other. "Freshest report across
+    // the fleet" measures HOW RECENTLY ANY LANE WORKED, because an idle lane's
+    // last report is its stop-hook and then ages forever by design. So a fleet
+    // that simply went quiet for an hour tripped this while perfectly healthy.
+    //
+    // Measured 2026-09-22 with hooks demonstrably working: the active lane's
+    // report was 9s old and idle lanes ranged to 6,909s. The 2026-09-20
+    // occurrence was 3,679s against a 3,600s threshold, 79 seconds over, and
+    // the freshest belonged to a lane that had itself been idle over an hour.
+    //
+    // The discriminator is what the last report SAID. A lane whose last report
+    // says `active` emits on every tool use, so a stale one is a hook that died
+    // mid-turn, and that is the real fault this exists to catch.
+    let stale_active: Vec<(&str, f64)> = lanes
+        .iter()
+        .filter(|l| l.last_state == "active")
+        .filter_map(|l| l.report_age_s.map(|age| (l.name.as_str(), age)))
+        .filter(|(_, age)| *age > max_freshest_s)
+        .collect();
+    // NAME THE AGE BESIDE THE LANE, so the reader does not re-derive it from
+    // the threshold. A pre-existing test requires this and caught its absence.
+    let stale_named = stale_active
+        .iter()
+        .map(|(n, age)| format!("{n} {age:.0}s"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    if !stale_active.is_empty() {
         return vec![InvariantResult::fail(
             ID,
-            format!("freshest self-report across the fleet < {max_freshest_s:.0}s"),
+            format!("a lane reporting `active` self-reports within {max_freshest_s:.0}s"),
             format!(
-                "youngest report across {} running lanes is {freshest:.0}s old (from {freshest_name}; \
-                 {with_report} lanes carry any report) — report control plane down fleet-wide, \
-                 status is on pane-scrape",
+                "{} of {} running lanes last reported `active` but have not reported in over \
+                 {max_freshest_s:.0}s ({}) — their hooks stopped mid-turn, so status for them is \
+                 on pane-scrape",
+                stale_active.len(),
+                lanes.len(),
+                stale_named
+            ),
+        )
+        .evidence(json!({
+            "running_lanes": lanes.len(),
+            "lanes_with_report": with_report,
+            "stale_active_lanes": stale_active
+                .iter()
+                .map(|(n, age)| json!({"lane": n, "report_age_s": age}))
+                .collect::<Vec<_>>(),
+            "freshest_report_age_s": freshest,
+            "freshest_lane": freshest_name,
+            "threshold_s": max_freshest_s,
+            "class": "report-control-plane-down",
+            "incident": "2026-08-13: baked-in report hooks POSTed to the dead 8822 silently; \
+                         0/48 fresh self-reports, worker status inaccurate/delayed",
+        }))];
+    }
+    if freshest > max_freshest_s {
+        // UNKNOWN, NOT PASS and not FAIL. Every report is stale and not one
+        // lane claims to be working, which is exactly what a quiet fleet and a
+        // dead control plane both look like from here. Saying which is missing
+        // is the honest answer; asserting either would be a guess.
+        return vec![InvariantResult::unknown(
+            ID,
+            format!(
+                "freshest report across {} running lanes is {freshest:.0}s old (from \
+                 {freshest_name}), but no lane's last report says `active` — an idle lane stops \
+                 reporting by design, so a quiet fleet and a dead hook are indistinguishable \
+                 until some lane is mid-turn",
                 lanes.len()
             ),
         )
@@ -1687,9 +1786,7 @@ pub fn self_reports_landing(
             "freshest_report_age_s": freshest,
             "freshest_lane": freshest_name,
             "threshold_s": max_freshest_s,
-            "class": "report-control-plane-down",
-            "incident": "2026-08-13: baked-in report hooks POSTed to the dead 8822 silently; \
-                         0/48 fresh self-reports, worker status inaccurate/delayed",
+            "missing_condition": "no running lane last reported `active`",
         }))];
     }
     vec![InvariantResult::pass(ID).evidence(json!({
@@ -1705,6 +1802,16 @@ pub fn self_reports_landing(
 pub struct LaneReport {
     pub name: String,
     pub report_age_s: Option<f64>,
+    /// AMUX-4917: what that last report SAID the lane was doing.
+    ///
+    /// Age alone cannot tell a quiet fleet from a dead hook. An ACTIVE lane
+    /// reports every tool use, so a stale report from one is a hook that died
+    /// mid-turn. An IDLE lane's last report was its stop-hook and then ages
+    /// indefinitely by design, which is health, not an outage.
+    ///
+    /// Empty when the lane has never reported, which the `with_report == 0`
+    /// arm handles separately and still treats as a real outage.
+    pub last_state: String,
 }
 
 // ---------------------------------------------------------------------------
@@ -5074,6 +5181,7 @@ mod negative_controls {
             target_idle: true,
             block_reason: None,
             idle_since: None,
+            target_selector_wait: false,
         }];
         let rs = queue_has_live_consumer(&items, 7_560.0, 300.0, 3_600.0); // 2h6m, the real age
         assert!(rs.iter().any(|r| r.status == Status::Fail), "must detect the dead consumer");
@@ -5095,6 +5203,7 @@ mod negative_controls {
             target_idle: false,
             block_reason: Some(reason.into()),
             idle_since: None,
+            target_selector_wait: false,
         };
         // Inside the reaper's deadline: sanctioned wait, pass.
         let rs = queue_has_live_consumer(&[mk("no-env-file", 6_000.0)], 7_560.0, 300.0, 3_600.0);
@@ -5164,6 +5273,7 @@ mod negative_controls {
             target_idle: true, // carries a stale, never-decaying idle report (AMUX-2646)
             block_reason: Some("no-env-file".into()),
             idle_since: None,
+            target_selector_wait: false,
         }];
         // Post-AMUX-3473: the ghost still fails, but only PAST the reaper's
         // deadline (2h6m old vs a 1h deadline here), and the class names the
@@ -5369,12 +5479,47 @@ mod negative_controls {
             target_idle: false, // mid-turn: queueing is the POINT
             block_reason: None,
             idle_since: None,
+            target_selector_wait: false, // pane genuinely shows a live turn, not a selector
         }];
         let rs = queue_has_live_consumer(&items, 7_560.0, 300.0, 3_600.0);
         assert!(
             rs.iter().all(|r| r.status == Status::Pass),
             "a deep queue behind a busy worker is correct, not a fault"
         );
+    }
+
+    /// AF-219: the same "reports active, not idle, no block_reason" shape as the
+    /// control above, but the pane scrape shows the lane parked at a selector
+    /// instead of genuinely mid-turn. The report cannot tell these apart (an
+    /// `active` report has no staleness bound, since the only exit is the turn
+    /// ending, and a turn blocked on a human never ends) -- this is the missing
+    /// branch, verified against both directions so the mutation is real:
+    /// flipping `target_selector_wait` to false must fall through to the PASS
+    /// above, not fail regardless of the field.
+    #[test]
+    fn a_lane_parked_on_a_human_decision_is_not_a_busy_worker() {
+        let items = vec![QueuedItem {
+            queue: "steering".into(),
+            target: "amux".into(),
+            queued_at: 0.0,
+            target_idle: false, // report still says "active": the Stop hook never fired
+            block_reason: None,
+            idle_since: None,
+            target_selector_wait: true, // but the pane shows a live AskUserQuestion selector
+        }];
+        // Inside the delivery loop's own tick window: not yet worth surfacing.
+        let rs = queue_has_live_consumer(&items, 120.0, 300.0, 3_600.0);
+        assert!(
+            rs.iter().all(|r| r.status == Status::Pass),
+            "a selector wait under the stale threshold is not yet a finding: {rs:?}"
+        );
+        // Past it -- the 08-25 incident's own shape (5.5h old, still parked).
+        let rs = queue_has_live_consumer(&items, 7_560.0, 300.0, 3_600.0);
+        let f = rs
+            .iter()
+            .find(|r| r.status == Status::Fail)
+            .expect("a lane parked on a human past the deadline must surface, not read as busy");
+        assert_eq!(f.evidence["class"].as_str(), Some("waiting-on-human"), "{}", f.evidence);
     }
 
     /// An INDENTED block in a doc comment is a Markdown code block, so rustdoc
@@ -5452,6 +5597,7 @@ mod negative_controls {
             target_idle: true,
             block_reason: None,
             idle_since: Some(idle_since),
+            target_selector_wait: false,
         };
 
         // Just went idle after a long turn: the queue has had 5s to drain.
@@ -5493,9 +5639,11 @@ mod negative_controls {
             .map(|i| LaneReport {
                 name: format!("lane-{i}"),
                 report_age_s: Some(143_000.0 + i as f64),
+                // Idle: their last report was a stop-hook and ages by design.
+                last_state: "idle".into(),
             })
             .collect();
-        lanes.push(LaneReport { name: "primis".into(), report_age_s: Some(7_379.0) });
+        lanes.push(LaneReport { name: "primis".into(), report_age_s: Some(7_379.0), last_state: "active".into() });
         let rs = self_reports_landing(&lanes, 10, 3600.0);
         assert_eq!(rs.len(), 1);
         assert_eq!(rs[0].status, Status::Fail, "youngest 7379s > 3600s must fail: {rs:?}");
@@ -5513,9 +5661,10 @@ mod negative_controls {
             .map(|i| LaneReport {
                 name: format!("idle-{i}"),
                 report_age_s: Some(30_000.0),
+                last_state: "idle".into(),
             })
             .collect();
-        lanes.push(LaneReport { name: "busy".into(), report_age_s: Some(4.0) });
+        lanes.push(LaneReport { name: "busy".into(), report_age_s: Some(4.0), last_state: "active".into() });
         let rs = self_reports_landing(&lanes, 10, 3600.0);
         assert!(
             rs.iter().all(|r| r.status == Status::Pass),
@@ -5528,18 +5677,91 @@ mod negative_controls {
     #[test]
     fn a_fleet_with_zero_reports_fails_as_control_plane_down() {
         let lanes: Vec<LaneReport> = (0..20)
-            .map(|i| LaneReport { name: format!("l-{i}"), report_age_s: None })
+            .map(|i| LaneReport { name: format!("l-{i}"), report_age_s: None, last_state: String::new() })
             .collect();
         let rs = self_reports_landing(&lanes, 10, 3600.0);
         assert_eq!(rs[0].status, Status::Fail);
         assert!(rs[0].observed.contains("0 of 20"), "{}", rs[0].observed);
     }
 
+    /// AMUX-4917. A FLEET THAT IS MERELY QUIET IS NOT A DEAD CONTROL PLANE.
+    ///
+    /// Every lane is idle and every report is stale, which is exactly what a
+    /// healthy fleet looks like overnight: an idle lane's last report is its
+    /// stop-hook and then ages forever by design. Reading that as an outage is
+    /// what filed this check 166 times, including a 2026-09-20 occurrence that
+    /// was 79 seconds over its own threshold.
+    ///
+    /// Unknown, not Pass: nothing here proves the hooks work either, and the
+    /// message must name the condition that is missing.
+    #[test]
+    fn an_all_idle_fleet_is_unknown_not_an_outage() {
+        let lanes: Vec<LaneReport> = (0..40)
+            .map(|i| LaneReport {
+                name: format!("idle-{i}"),
+                report_age_s: Some(30_000.0),
+                last_state: "idle".into(),
+            })
+            .collect();
+        let rs = self_reports_landing(&lanes, 10, 3600.0);
+        assert_eq!(rs.len(), 1);
+        assert_eq!(
+            rs[0].status,
+            Status::Unknown,
+            "an all-idle fleet is quiet, not a reported outage: {rs:?}"
+        );
+        assert!(
+            rs[0].observed.contains("active"),
+            "must name the missing condition, that no lane is mid-turn: {}",
+            rs[0].observed
+        );
+    }
+
+    /// AMUX-4917, the other direction, and the one that matters most: narrowing
+    /// this check must not buy silence. A lane whose last report says `active`
+    /// emits on every tool use, so a stale one is a hook that died MID-TURN.
+    /// That still fails, and it fails even though a sibling lane is reporting
+    /// fresh, because the fleet minimum would otherwise hide it.
+    #[test]
+    fn a_lane_stale_while_reporting_active_still_fails() {
+        let mut lanes: Vec<LaneReport> = (0..40)
+            .map(|i| LaneReport {
+                name: format!("idle-{i}"),
+                report_age_s: Some(30_000.0),
+                last_state: "idle".into(),
+            })
+            .collect();
+        // A healthy neighbour, so the fleet minimum is fresh.
+        lanes.push(LaneReport {
+            name: "healthy".into(),
+            report_age_s: Some(5.0),
+            last_state: "idle".into(),
+        });
+        // The dead hook: says it is working, has not reported in two hours.
+        lanes.push(LaneReport {
+            name: "wedged".into(),
+            report_age_s: Some(7_200.0),
+            last_state: "active".into(),
+        });
+        let rs = self_reports_landing(&lanes, 10, 3600.0);
+        assert_eq!(rs.len(), 1);
+        assert_eq!(
+            rs[0].status,
+            Status::Fail,
+            "a lane claiming `active` with a two-hour-old report is a hook that died mid-turn: {rs:?}"
+        );
+        assert!(
+            rs[0].observed.contains("wedged"),
+            "must name the lane whose hook stopped: {}",
+            rs[0].observed
+        );
+    }
+
     /// A one- or two-lane box must read Unknown, never fire: a genuine quiet
     /// spell is plausible there, and a false alarm trains the reader to skim.
     #[test]
     fn a_tiny_fleet_is_unknown_not_a_false_alarm() {
-        let lanes = vec![LaneReport { name: "solo".into(), report_age_s: Some(999_999.0) }];
+        let lanes = vec![LaneReport { name: "solo".into(), report_age_s: Some(999_999.0), last_state: "active".into() }];
         let rs = self_reports_landing(&lanes, 10, 3600.0);
         assert_eq!(rs[0].status, Status::Unknown, "too-small fleet must be Unknown: {rs:?}");
     }
