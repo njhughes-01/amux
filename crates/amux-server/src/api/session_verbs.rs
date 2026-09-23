@@ -236,10 +236,20 @@ impl EnvFile {
                 continue;
             }
             let v = v.trim();
-            let v = if (v.starts_with('"') && v.ends_with('"') && v.len() >= 2)
-                || (v.starts_with('\'') && v.ends_with('\'') && v.len() >= 2)
+            let (v, was_double_quoted) = if v.starts_with('"') && v.ends_with('"') && v.len() >= 2
             {
-                &v[1..v.len() - 1]
+                (&v[1..v.len() - 1], true)
+            } else if v.starts_with('\'') && v.ends_with('\'') && v.len() >= 2 {
+                (&v[1..v.len() - 1], false)
+            } else {
+                (v, false)
+            };
+            // Only a DOUBLE-quoted value was escaped on the way out, and single quotes
+            // in shell do not take escapes at all, so unescaping one would corrupt it.
+            let owned;
+            let v = if was_double_quoted {
+                owned = crate::config::env_unquote(v);
+                owned.as_str()
             } else {
                 v
             };
@@ -288,7 +298,7 @@ impl EnvFile {
         use std::io::Write as _;
         let mut out = format!("# updated: {}\n", chrono::Local::now().format("%Y-%m-%dT%H:%M:%S%.6f"));
         for (k, v) in &self.pairs {
-            out.push_str(&format!("{k}=\"{v}\"\n"));
+            out.push_str(&crate::config::env_assignment(k, v));
         }
         if let Some(dir) = path.parent() {
             std::fs::create_dir_all(dir)?;
@@ -344,7 +354,7 @@ impl EnvFile {
                 }
             }
         }
-        let text: String = current.iter().map(|(key, value)| format!("{key}={value}\n")).collect();
+        let text: String = current.iter().map(|(key, value)| crate::config::env_assignment(key, value)).collect();
         use std::io::Write as _;
         if let Some(dir) = path.parent() { std::fs::create_dir_all(dir)?; }
         let tmp = unique_tmp_path(path);
@@ -7204,6 +7214,15 @@ pub(crate) fn final_frame_confirms(frame: FrameRead) -> bool {
     }
 }
 
+/// A repaint may briefly release input before drawing it again. Confirmation
+/// requires consecutive clear observations, including the final fallback read.
+fn observe_submission_frame(frame: FrameRead, cleared_once: &mut bool) -> bool {
+    let clear = final_frame_confirms(frame);
+    let confirmed = clear && *cleared_once;
+    *cleared_once = clear;
+    confirmed
+}
+
 pub(crate) fn read_frame(raw: &str, tail_sq: &str) -> FrameRead {
     let state = composer_state(raw);
     // No composer, or a composer that is not this lane's (the background
@@ -7386,15 +7405,13 @@ pub(crate) enum Submission {
 /// delivering" bug.
 ///
 /// Returns `Confirmed` once the input prompt no longer holds our text. If it
-/// still does AND the session is idle, a picker likely ate the Enter → press
-/// Escape+Enter to submit (`retry_keys`), spaced ≥1.3s from any earlier Escape
-/// because two Escapes inside ~1s read as a double-press and EAT the pending
-/// message. Biased to `Unverified` rather than `Stuck` when uncertain, so we
-/// never double-send.
+/// still does AND the session is idle, retry bare Enter. Picker-shaped text
+/// uses bracketed paste, so no autocomplete needs closing here. Escape can
+/// interrupt a just-accepted turn before its spinner/transcript is visible and
+/// restore the input after we have falsely reported submission.
 async fn verify_submitted(
     name: &str,
     text: &str,
-    esc_at: Option<std::time::Instant>,
     sent_at: f64,
     retry_keys: bool,
 ) -> (Submission, bool) {
@@ -7407,14 +7424,15 @@ async fn verify_submitted(
     // the pane width, splitting the tail across visual lines at arbitrary
     // points.
     let tail_sq: String = tail.split_whitespace().collect();
-    let mut esc_at = esc_at;
     let mut cleared_once = false;
     let mut stuck_looks = 0;
     let mut no_ui_looks = 0;
     for _ in 0..5 {
         sleep_ms(300).await;
         let raw = tmux_capture(name, 25).await;
-        match read_frame(&raw, &tail_sq) {
+        let frame = read_frame(&raw, &tail_sq);
+        let confirmed = observe_submission_frame(frame, &mut cleared_once);
+        match frame {
             // NO INPUT BOX AT ALL IS "NOT READY", NOT "SUBMITTED" (AC-271). A
             // successful submit leaves the composer rendered and EMPTY — the ❯
             // line is still there. So the absence of any ❯/› means Claude Code
@@ -7459,10 +7477,9 @@ async fn verify_submitted(
                 // text can render into the box AFTER our first look (keystrokes
                 // buffered through boot), so one clear look is not proof.
                 // Require two.
-                if cleared_once {
+                if confirmed {
                     return (Submission::Confirmed, retried);
                 }
-                cleared_once = true;
                 continue;
             }
             // The native queue clears the composer after accepting Enter.
@@ -7484,7 +7501,6 @@ async fn verify_submitted(
             // does not try.
             FrameRead::CollapsedPaste => {}
         }
-        cleared_once = false;
         // ONE stuck look is not proof either: for ~1s after a successful submit
         // the pane still shows the echoed text and no spinner yet (worse during
         // a resize repaint), which reads exactly like "stuck + idle". Acting on
@@ -7509,20 +7525,9 @@ async fn verify_submitted(
             }
             return (Submission::Stuck, retried);
         }
-        // Idle with our text genuinely stuck → press Escape (closes a picker
-        // WITHOUT selecting an entry; a bare Enter would pick one and rewrite an
-        // @path) then Enter. Any two Escapes within ~1s read as a double-press
-        // and EAT the pending message (v2.1.205), so space each retry's Escape
-        // ≥1.3s from the previous one, including the one send_text itself sent.
-        if let Some(at) = esc_at {
-            let elapsed = at.elapsed();
-            if elapsed < Duration::from_millis(1300) {
-                tokio::time::sleep(Duration::from_millis(1300) - elapsed).await;
-            }
-        }
-        send_key(name, "Escape").await;
-        esc_at = Some(std::time::Instant::now());
-        sleep_ms(60).await;
+        // Literal/paste delivery has already avoided autocomplete. Never
+        // interrupt a turn which accepted the first Enter but has not painted
+        // its active footer yet; bare Enter can submit/queue our pending text.
         send_key(name, "Enter").await;
         // A retry is EVIDENCE THE SEND PATH FAILED, not a routine step, so it
         // is logged at WARN and reported back to the caller (`retried` in the
@@ -7530,13 +7535,14 @@ async fn verify_submitted(
         // says "the keystroke path is dropping Enters on this lane".
         retried = true;
         tracing::warn!(
-            session = %name,
-            "send: Enter did not submit — retried Escape+Enter (keystroke delivery failure)"
+            session = %name, retry_mode="enter", verdict="submission_enter_retry",
+            "send: Enter did not submit — retried without interrupting the worker"
         );
         stuck_looks = 0;
     }
+    if cleared_once { sleep_ms(300).await; }
     let raw = tmux_capture(name, 25).await;
-    if final_frame_confirms(read_frame(&raw, &tail_sq)) {
+    if observe_submission_frame(read_frame(&raw, &tail_sq), &mut cleared_once) {
         return (Submission::Confirmed, retried);
     }
     // Last resort before reporting a failure (which makes callers re-send):
@@ -8640,10 +8646,11 @@ async fn send_text_inner(
     //
     // Mid-turn we retry with a BARE Enter and never an Escape: Escape mid-turn
     // is an INTERRUPT that kills the running response (py:25597's warning, and
-    // this session's own "[Request interrupted by user]" records). Idle, the
-    // Escape+Enter pair is correct because a picker may be holding the Enter.
+    // this session's own "[Request interrupted by user]" records). Idle retries
+    // also use bare Enter: picker-shaped input was pasted, so Escape would only
+    // risk interrupting a newly accepted turn.
     // ------------------------------------------------------------------
-    let (first, retried) = verify_submitted(name, &text, esc_at, sent_at, !generating).await;
+    let (first, retried) = verify_submitted(name, &text, sent_at, !generating).await;
     if first == Submission::Stuck && generating {
         // One bare-Enter retry, then re-read the evidence. No sleep-tuning: the
         // retry is gated on the OBSERVED composer contents, not on a guess
@@ -8654,7 +8661,7 @@ async fn send_text_inner(
             "send: mid-turn Enter was not accepted — retrying with a bare Enter (keystroke delivery failure)"
         );
         send_key(name, "Enter").await;
-        let (second, _) = verify_submitted(name, &text, None, sent_at, false).await;
+        let (second, _) = verify_submitted(name, &text, sent_at, false).await;
         return send_outcome(second, generating, true);
     }
     send_outcome(first, generating, retried)
@@ -26338,6 +26345,129 @@ mod tests {
     }
 
     #[test]
+    fn a_value_with_command_substitution_is_inert_when_the_file_is_sourced() {
+        // THE REGRESSION. This file is sourced. Before env_quote, a value containing
+        // $(...) ran on every source: a CC_WORKTREE_VERIFY value executed `git
+        // rev-parse` and printed `graft_inflight_order_key: command not found` from a
+        // shell that was only meant to read variables.
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("x.env");
+        let marker = dir.path().join("SHOULD_NOT_EXIST");
+        let payload = format!("before $(touch {}) after", marker.display());
+
+        let mut e = EnvFile::default();
+        e.set("CC_TEST", &payload);
+        e.write(&p).unwrap();
+
+        let out = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(format!(". {}; printf %s \"$CC_TEST\"", p.display()))
+            .output()
+            .unwrap();
+
+        assert!(!marker.exists(), "sourcing the env file EXECUTED the value");
+        assert_eq!(String::from_utf8_lossy(&out.stdout), payload);
+        assert_eq!(EnvFile::load(&p).get("CC_TEST"), Some(payload.as_str()));
+    }
+
+    #[test]
+    fn every_env_writer_and_reader_agrees_on_an_escaped_value() {
+        // Escaping in EnvFile alone split the file format: the worker-scope merge
+        // and config-as-code apply read with parse_env_file (no unescape) and wrote
+        // `K=v` unquoted, so a merge baked the escape backslashes into the value and
+        // every later EnvFile write doubled them.
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("x.env");
+        let marker = dir.path().join("SHOULD_NOT_EXIST");
+        let payload = format!(r#"["a \"b\"", "c\d"] $(touch {}) `x`"#, marker.display());
+
+        let mut e = EnvFile::default();
+        e.set("CC_TEST", &payload);
+        e.write(&p).unwrap();
+        assert_eq!(crate::config::parse_env_file(&p).get("CC_TEST"), Some(&payload));
+
+        EnvFile::merge_plain(&p, &[("CC_OTHER".into(), Some("y".into()))]).unwrap();
+        EnvFile::merge_plain(&p, &[("CC_OTHER".into(), None)]).unwrap();
+        assert_eq!(EnvFile::load(&p).get("CC_TEST"), Some(payload.as_str()));
+        assert_eq!(crate::config::parse_env_file(&p).get("CC_TEST"), Some(&payload));
+
+        let out = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(format!(". {}; printf %s \"$CC_TEST\"", p.display()))
+            .output()
+            .unwrap();
+        assert!(!marker.exists(), "sourcing a merged env file EXECUTED the value");
+        assert_eq!(String::from_utf8_lossy(&out.stdout), payload);
+
+        // A second EnvFile round trip must not add backslashes.
+        let mut again = EnvFile::load(&p);
+        again.set("CC_THIRD", "z");
+        again.write(&p).unwrap();
+        assert_eq!(EnvFile::load(&p).get("CC_TEST"), Some(payload.as_str()));
+    }
+
+    #[test]
+    fn a_value_containing_double_quotes_survives_a_source_and_a_reload() {
+        // The CC_ACCEPTANCE_CRITERIA shape: a JSON array of quoted strings. Unescaped,
+        // the first inner quote ended the assignment and the rest of the line became
+        // commands, which is why `amux info` died on `search: command not found`.
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("x.env");
+        let payload = r#"["search returns identical results","no regressions"]"#;
+
+        let mut e = EnvFile::default();
+        e.set("CC_ACCEPTANCE_CRITERIA", payload);
+        e.write(&p).unwrap();
+
+        let out = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(format!(
+                ". {}; printf %s \"$CC_ACCEPTANCE_CRITERIA\"",
+                p.display()
+            ))
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "the env file did not parse as shell");
+        assert_eq!(String::from_utf8_lossy(&out.stdout), payload);
+        assert_eq!(EnvFile::load(&p).get("CC_ACCEPTANCE_CRITERIA"), Some(payload));
+    }
+
+    #[test]
+    fn backticks_and_a_lone_backslash_round_trip() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("x.env");
+        let payload = r"a `id` b \ c $HOME";
+        let mut e = EnvFile::default();
+        e.set("CC_TEST", payload);
+        e.write(&p).unwrap();
+        assert_eq!(EnvFile::load(&p).get("CC_TEST"), Some(payload));
+    }
+
+    #[test]
+    fn legacy_unescaped_files_still_load_unchanged() {
+        // BACKWARD COMPATIBILITY. 154 session env files existed when escaping landed,
+        // all written by the unescaped writer, and none contained a backslash. A value
+        // that never had one must read back byte-identical.
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("x.env");
+        std::fs::write(&p, "CC_DIR=\"/tmp/a b\"\nCC_TAGS='x, y'\nCC_DESC=plain\n").unwrap();
+        let e = EnvFile::load(&p);
+        assert_eq!(e.get("CC_DIR"), Some("/tmp/a b"));
+        assert_eq!(e.get("CC_TAGS"), Some("x, y"));
+        assert_eq!(e.get("CC_DESC"), Some("plain"));
+    }
+
+    #[test]
+    fn a_single_quoted_legacy_value_is_not_unescaped() {
+        // Single quotes take no escapes in shell, so a backslash inside them is
+        // literal. Unescaping one would silently change a stored value.
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("x.env");
+        std::fs::write(&p, "CC_TAGS='a\\\"b'\n").unwrap();
+        assert_eq!(EnvFile::load(&p).get("CC_TAGS"), Some("a\\\"b"));
+    }
+
+    #[test]
     fn env_file_roundtrip_preserves_order_and_quotes() {
         let dir = tempfile::tempdir().unwrap();
         let p = dir.path().join("x.env");
@@ -30374,6 +30504,72 @@ mod submission_gate_tests {
         assert!(!submission_records_have(&[quoted], GHOST, 119.0));
     }
 
+    #[test]
+    fn submission_confirmation_requires_consecutive_clear_frames() {
+        let mut cleared_once = false;
+        for interruption in [FrameRead::NoUi, FrameRead::StillThereIdle,
+            FrameRead::StillThereGenerating, FrameRead::CollapsedPaste] {
+            assert!(!observe_submission_frame(FrameRead::Cleared, &mut cleared_once));
+            assert!(!observe_submission_frame(interruption, &mut cleared_once));
+        }
+        assert!(!observe_submission_frame(FrameRead::Cleared, &mut cleared_once),
+            "a final single clear frame is not confirmation after a repaint or retry");
+        assert!(observe_submission_frame(FrameRead::Cleared, &mut cleared_once));
+    }
+
+    #[tokio::test]
+    #[ignore = "real tmux retry replay; no model or production worker; run explicitly"]
+    async fn real_tmux_paste_retry_never_sends_escape() {
+        struct Pane(String);
+        impl Drop for Pane {
+            fn drop(&mut self) {
+                let st = session_target(&self.0);
+                let _ = std::process::Command::new("tmux")
+                    .args(["kill-session", "-t", &st]).output();
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let initial = dir.path().join("pending.txt");
+        let cleared = dir.path().join("cleared.txt");
+        let keys = dir.path().join("keys.bin");
+        std::fs::write(&initial, frame_stuck_idle(GHOST)).unwrap();
+        std::fs::write(&cleared, frame_cleared()).unwrap();
+        let lane = format!("paste-retry-{}-{}", std::process::id(), (now_f64() * 1_000_000.0) as u64);
+        let pane = Pane(tmux_name(&lane));
+        let replay = r#"import os,pathlib,select,sys,time,tty
+        "#;
+        let replay = format!("{}\n{}", replay.trim(), r#"tty.setraw(sys.stdin.fileno())
+def paint(path):
+    sys.stdout.write('\x1b[2J\x1b[H'+pathlib.Path(path).read_text().replace('\n','\r\n'))
+    sys.stdout.flush()
+paint(sys.argv[1])
+end=time.monotonic()+20
+with open(sys.argv[3],'ab',buffering=0) as log:
+    while time.monotonic()<end:
+        if not select.select([sys.stdin],[],[],0.2)[0]: continue
+        key=os.read(sys.stdin.fileno(),1)
+        log.write(key)
+        if key in (b'\r',b'\n'): paint(sys.argv[2])
+"#);
+        let output = std::process::Command::new("tmux").args([
+            "new-session", "-d", "-s", &pane.0, "-x", "200", "-y", "24",
+            "python3", "-c", &replay, initial.to_str().unwrap(), cleared.to_str().unwrap(), keys.to_str().unwrap(),
+        ]).output().unwrap();
+        assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            if read_frame(&tmux_capture(&lane, 25).await, &tail_sq(GHOST)) == FrameRead::StillThereIdle { break; }
+            assert!(std::time::Instant::now() < deadline, "replay never drew the pending input");
+            sleep_ms(50).await;
+        }
+        let (observed, retried) = verify_submitted(&lane, GHOST, 0.0, true).await;
+        assert_eq!(observed, Submission::Confirmed);
+        assert!(retried);
+        let delivered = std::fs::read(&keys).unwrap();
+        assert!(delivered.contains(&b'\r'), "retry must actually submit pending input");
+        assert!(!delivered.contains(&0x1b), "paste retry must not interrupt a newly accepted turn: {delivered:?}");
+    }
+
     #[tokio::test]
     #[ignore = "real tmux capture replay; no model or production worker; run explicitly"]
     async fn real_tmux_submission_replay_keeps_generating_input_unconfirmed() {
@@ -30399,7 +30595,7 @@ mod submission_gate_tests {
             // Walk the actual asynchronous capture/verification loop, with no
             // key retries or transcript claims. The busy fixture must fail
             // verification; the drawn empty composer is the positive control.
-            let (observed, retried) = verify_submitted(&lane, GHOST, None, 0.0, false).await;
+            let (observed, retried) = verify_submitted(&lane, GHOST, 0.0, false).await;
             assert_eq!(observed, expected);
             assert!(!retried);
         }

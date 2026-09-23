@@ -405,6 +405,72 @@ mod home_resolution_tests {
     }
 }
 
+/// Escape a value for a DOUBLE-QUOTED shell assignment.
+///
+/// THIS FILE IS SOURCED. Before this existed, `write_unlocked` emitted
+/// `K="<raw value>"` with no escaping at all, so:
+///
+///   * a value containing `$(...)` or a backtick EXECUTED on every source. Observed
+///     2026-09-20 on a CC_WORKTREE_VERIFY value, which ran `git rev-parse` and
+///     printed `graft_inflight_order_key: command not found` from a shell that was
+///     only meant to read variables.
+///   * a value containing a bare `"` ended the string early and turned the remainder
+///     of the line into commands. That is why CC_ACCEPTANCE_CRITERIA, which stores a
+///     JSON array of quoted strings, breaks `amux info` with `search: command not
+///     found`.
+///
+/// The four characters that keep their meaning inside double quotes are `\`, `"`,
+/// `$` and a backtick, so those are exactly the four escaped here.
+///
+/// NEWLINES ARE DELIBERATELY LEFT ALONE. A literal newline inside double quotes is
+/// valid shell and survives `source`, so escaping it would change the value a
+/// consumer sees. `load` is line-based and will not round-trip one, which is a
+/// pre-existing limit this change neither fixes nor worsens.
+pub fn env_quote(v: &str) -> String {
+    let mut out = String::with_capacity(v.len() + 8);
+    for c in v.chars() {
+        if matches!(c, '\\' | '"' | '$' | '`') {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    out
+}
+
+/// Reverse `env_quote`.
+///
+/// Only the four sequences `env_quote` can emit are consumed; any other backslash is
+/// left exactly as it was. That matters for BACKWARD COMPATIBILITY: 154 session env
+/// files existed when this landed, written by the unescaped writer, and none of them
+/// contained a backslash at all, so no stored value changes meaning. A legacy value
+/// that did contain one keeps it unless it happens to precede one of the four.
+pub fn env_unquote(v: &str) -> String {
+    let mut out = String::with_capacity(v.len());
+    let mut chars = v.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\\' {
+            match chars.peek() {
+                Some(&n) if matches!(n, '\\' | '"' | '$' | '`') => {
+                    out.push(n);
+                    chars.next();
+                }
+                _ => out.push(c),
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
+/// One `KEY="value"` line, escaped with [`env_quote`]. The ONE writer shape for env
+/// files that are also `source`d, so every writer (EnvFile, the worker-scope merge,
+/// config-as-code apply) produces what [`parse_env_file`] and bash read back
+/// identically.
+pub fn env_assignment(key: &str, value: &str) -> String {
+    format!("{key}=\"{}\"\n", env_quote(value))
+}
+
 /// Parse a KEY=VALUE env file. Supports `#` comments, blank lines, single or
 /// double quoted values, and `export ` prefixes — the shapes that appear in
 /// real server.env files today.
@@ -424,13 +490,17 @@ pub fn parse_env_file(path: &Path) -> BTreeMap<String, String> {
         };
         let k = k.trim();
         let mut v = v.trim();
-        if (v.starts_with('"') && v.ends_with('"') && v.len() >= 2)
-            || (v.starts_with('\'') && v.ends_with('\'') && v.len() >= 2)
-        {
+        // Double quotes take the four escapes bash honours there; single quotes
+        // take none. Reading them any other way disagreed with EnvFile and with
+        // `source` once values were escaped.
+        let mut owned = None;
+        if v.starts_with('"') && v.ends_with('"') && v.len() >= 2 {
+            owned = Some(env_unquote(&v[1..v.len() - 1]));
+        } else if v.starts_with('\'') && v.ends_with('\'') && v.len() >= 2 {
             v = &v[1..v.len() - 1];
         }
         if !k.is_empty() {
-            out.insert(k.to_string(), v.to_string());
+            out.insert(k.to_string(), owned.unwrap_or_else(|| v.to_string()));
         }
     }
     out
