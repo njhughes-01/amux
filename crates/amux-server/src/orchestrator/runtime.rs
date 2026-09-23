@@ -603,9 +603,11 @@ impl Runtime {
         let earliest_event: Option<String> = conn.query_row(
             "SELECT MIN(at) FROM _amux_state_events",
             [], |r| r.get(0))?;
-        let earliest_event = earliest_event
-            .map(|at| at.parse::<DateTime<Utc>>())
-            .transpose()?;
+        let earliest_event = earliest_event.and_then(|at| {
+            at.parse::<DateTime<Utc>>()
+                .map_err(|e| tracing::warn!(error = %e, "unparseable _amux_state_events.at; no-progress stays unjudged"))
+                .ok()
+        });
         // A close admits a probe (`can_recover`), so no-progress is judged
         // again only once a full window has elapsed since that close — the
         // same fair chance `window_elapsed` gives a newly started server. The
@@ -620,9 +622,13 @@ impl Runtime {
                  WHERE singleton = 1 AND json_extract(state, '$.kind') = 'normal'",
                 [], |r| r.get(0)).optional()?
         };
-        let last_close = last_close
-            .map(|at| at.parse::<DateTime<Utc>>())
-            .transpose()?;
+        // Unparseable reads as "no close": the old flapping at worst, never a
+        // failed tick that halts planning.
+        let last_close = last_close.and_then(|at| {
+            at.parse::<DateTime<Utc>>()
+                .map_err(|e| tracing::warn!(error = %e, "unparseable _amux_fleet_state.updated_at; ignoring last close"))
+                .ok()
+        });
         Ok(amux_core::circuit::WindowStats {
             tokens_spent,
             tasks_completed: completed,
@@ -2431,10 +2437,12 @@ mod adherence_tests {
     }
 
     fn fleet_kind(runtime: &Runtime) -> &'static str {
+        use amux_core::circuit::{CircuitOpenReason, FleetState};
         match &*runtime.fleet_state.lock().unwrap() {
-            amux_core::circuit::FleetState::Normal => "normal",
-            amux_core::circuit::FleetState::CircuitOpen { .. } => "open",
-            amux_core::circuit::FleetState::Reconciling { .. } => "reconciling",
+            FleetState::Normal => "normal",
+            FleetState::CircuitOpen { reason: CircuitOpenReason::NoProgress { .. }, .. } => "open:no_progress",
+            FleetState::CircuitOpen { .. } => "open:other",
+            FleetState::Reconciling { .. } => "reconciling",
         }
     }
 
@@ -2457,7 +2465,7 @@ mod adherence_tests {
         rt.breaker.min_progress_per_window = 1;
 
         rt.tick_once(false).await.unwrap();
-        assert_eq!(fleet_kind(&rt), "open", "a full window with no completions trips");
+        assert_eq!(fleet_kind(&rt), "open:no_progress", "a full window with no completions trips");
         rt.tick_once(false).await.unwrap();
         assert_eq!(fleet_kind(&rt), "normal", "runnable work admits a probe");
         for _ in 0..3 {
@@ -2480,7 +2488,7 @@ mod adherence_tests {
             })
             .unwrap();
         rt.tick_once(false).await.unwrap();
-        assert_eq!(fleet_kind(&rt), "open", "no progress after the probe window re-trips");
+        assert_eq!(fleet_kind(&rt), "open:no_progress", "no progress after the probe window re-trips");
     }
 
     fn runtime(store: SharedStore, protocol: Option<Arc<MockProtocol>>, pickup: bool) -> Runtime {

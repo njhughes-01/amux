@@ -109,9 +109,12 @@ pub struct WindowStats {
     /// At least one non-terminal task exists. An empty queue is healthy, not
     /// evidence that a progress-producing fleet is stalled.
     pub has_live_work: bool,
-    /// The store contains observations spanning a complete window. Without
-    /// this guard, a newly started server trips the no-progress breaker before
-    /// it has had a fair chance to complete anything.
+    /// The store contains observations spanning a complete window, and no
+    /// close happened within it. Without this guard, a newly started server
+    /// trips the no-progress breaker before it has had a fair chance to
+    /// complete anything; likewise a probe admitted by [`FleetCircuitBreaker::
+    /// can_recover`] would be re-tripped on the next tick, while the window
+    /// still holds the pre-probe stall.
     pub window_elapsed: bool,
 }
 
