@@ -1046,7 +1046,11 @@ pub fn rotate_session_logs(logs_dir: &Path) -> (usize, u64) {
 /// Returns (before, after) so the caller can publish both. A checkpoint that
 /// ran and freed nothing is a different fact from one that never ran, and only
 /// reporting both tells them apart (ethos rule 4).
-async fn checkpoint_wal(store: &crate::db::SharedStore) -> (Option<u64>, Option<u64>) {
+/// Returns (WAL bytes before, WAL bytes after, blocked). `blocked` is the
+/// checkpoint's own verdict: SQLite reports a TRUNCATE held off by a reader or
+/// the writer as a RESULT ROW with busy=1, not as an error, so it is read from
+/// that row rather than inferred from sizes (`None` when the pragma did not run).
+async fn checkpoint_wal(store: &crate::db::SharedStore) -> (Option<u64>, Option<u64>, Option<bool>) {
     let t0 = std::time::Instant::now();
     // `read_async`, NOT `write_async`, and that is the whole fix.
     //
@@ -1068,7 +1072,10 @@ async fn checkpoint_wal(store: &crate::db::SharedStore) -> (Option<u64>, Option<
                 .map(|p| std::path::PathBuf::from(format!("{p}-wal")));
             let size = || wal.as_ref().and_then(|w| std::fs::metadata(w).ok()).map(|m| m.len());
             let before = size();
-            let ran = conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);").map_err(|e| e.to_string());
+            let ran = conn
+                .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |r| r.get::<_, i64>(0))
+                .map(|busy| busy != 0)
+                .map_err(|e| e.to_string());
             let after = size();
             Ok((before, ran, after))
         })
@@ -1077,8 +1084,15 @@ async fn checkpoint_wal(store: &crate::db::SharedStore) -> (Option<u64>, Option<
         Ok((b, ran, a)) => (b, a, ran),
         Err(e) => (None, None, Err(e.to_string())),
     };
+    let blocked = res.as_ref().ok().copied();
     match res {
-        Ok(()) => {
+        Ok(true) => tracing::warn!(
+            before_bytes = ?before, after_bytes = ?after,
+            took_ms = t0.elapsed().as_millis() as u64,
+            "storage sweep: wal_checkpoint(TRUNCATE) was BLOCKED (busy=1) — a reader or \
+             the writer held it past busy_timeout; the WAL was not truncated (AMUX-4811)"
+        ),
+        Ok(false) => {
             // Two-fix rule: when this regresses, the log says so without
             // anyone comparing sizes by hand. A TRUNCATE that leaves the file
             // large means a reader held the checkpoint off, which is the
@@ -1099,7 +1113,7 @@ async fn checkpoint_wal(store: &crate::db::SharedStore) -> (Option<u64>, Option<
         }
         Err(e) => tracing::warn!(error = %e, "storage sweep: wal_checkpoint(TRUNCATE) failed"),
     }
-    (before, after)
+    (before, after, blocked)
 }
 
 /// VACUUM at most once per day, when the storage sweep actually deleted rows.
@@ -1142,6 +1156,12 @@ async fn maybe_vacuum(home: &Path) -> bool {
         if age < min_interval {
             return false;
         }
+    }
+    // Once per process: the skip is a standing fact until the writer-thread
+    // VACUUM lands, and repeating it every hourly tick would be noise.
+    static SKIP_LOGGED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if SKIP_LOGGED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        return false;
     }
     tracing::info!(
         knob = "AMUX_VACUUM_INTERVAL_SECS",
@@ -1193,6 +1213,8 @@ pub struct StorageReport {
     /// different readings, which is the distinction that hid this for a month.
     pub wal_before_bytes: Option<u64>,
     pub wal_after_bytes: Option<u64>,
+    /// The checkpoint's own busy verdict (see `checkpoint_wal`).
+    pub wal_checkpoint_blocked: Option<bool>,
     pub rotated_logs_removed: usize,
     pub rotated_logs_freed: u64,
     pub free_bytes: Option<u64>,
@@ -1336,7 +1358,8 @@ pub async fn storage_tick(state: &AppState, home: &Path) -> StorageReport {
     // be reachable only through maybe_vacuum below, so a tick that deleted
     // nothing never truncated the WAL and it grew until some later tick both
     // deleted something AND cleared the 24h vacuum interval.
-    let (wal_before, wal_after) = checkpoint_wal(&state.store).await;
+    let (wal_before, wal_after, wal_blocked) = checkpoint_wal(&state.store).await;
+    rep.wal_checkpoint_blocked = wal_blocked;
     rep.wal_before_bytes = wal_before;
     rep.wal_after_bytes = wal_after;
 
@@ -1440,6 +1463,8 @@ pub async fn debug_storage() -> axum::Json<Value> {
             "diagnostic_dirs": r.diagnostic_dirs,
             "dirs_removed": r.dirs_removed, "dir_bytes_freed": r.dir_bytes_freed,
             "vacuumed": r.vacuumed,
+            "wal_before_bytes": r.wal_before_bytes, "wal_after_bytes": r.wal_after_bytes,
+            "wal_checkpoint_blocked": r.wal_checkpoint_blocked,
             "rotated_logs_removed": r.rotated_logs_removed,
             "rotated_logs_freed": r.rotated_logs_freed,
             "took_ms": r.took_ms,
@@ -2088,10 +2113,39 @@ mod tests {
         let grown = std::fs::metadata(&wal).unwrap().len();
         assert!(grown > 0, "the fixture must actually produce a WAL to truncate");
 
-        let (before, after) = checkpoint_wal(&store).await;
+        let (before, after, blocked) = checkpoint_wal(&store).await;
+        assert_eq!(blocked, Some(false), "an unobstructed TRUNCATE is not blocked");
         assert!(before.unwrap_or(0) > 0, "the WAL must be measured before: {before:?}");
         assert_eq!(after, Some(0), "TRUNCATE must empty the WAL: {before:?} -> {after:?}");
         assert_eq!(std::fs::metadata(&wal).unwrap().len(), 0);
+    }
+
+    /// SQLite reports a checkpoint held off by a reader as busy=1 in its result
+    /// row, not as an error; `execute_batch` threw that row away and the tick
+    /// logged success. An open read transaction on another connection must make
+    /// the checkpoint report `blocked`, and the WAL must not be emptied.
+    #[tokio::test]
+    async fn a_checkpoint_held_off_by_a_reader_reports_blocked() {
+        let dir = tempfile::tempdir().unwrap();
+        let (store, wal) = store_with_a_grown_wal(dir.path(), "t.db").await;
+        // The fixture's inserts trip SQLite's auto-checkpoint, and a reader that
+        // starts on a fully backfilled WAL reads the DB file alone and does NOT
+        // hold TRUNCATE off. So leave a fresh, un-backfilled frame first.
+        store
+            .write_async(|conn| {
+                conn.execute("INSERT INTO wal_fixture(v) VALUES (x'00')", [])?;
+                Ok(crate::db::WriteOutcome { applied: false, events: vec![] })
+            })
+            .await
+            .unwrap();
+        let db = wal.to_string_lossy().trim_end_matches("-wal").to_string();
+        let reader = rusqlite::Connection::open(&db).unwrap();
+        reader.execute_batch("BEGIN;").unwrap();
+        let _: i64 = reader.query_row("SELECT count(*) FROM wal_fixture", [], |r| r.get(0)).unwrap();
+        let (_before, after, blocked) = checkpoint_wal(&store).await;
+        reader.execute_batch("COMMIT;").unwrap();
+        assert_eq!(blocked, Some(true), "a reader-held TRUNCATE must report blocked, not success");
+        assert!(after.unwrap_or(0) > 0, "a blocked TRUNCATE cannot have emptied the WAL: {after:?}");
     }
 
     /// Why `maybe_vacuum` does not use the read pool: VACUUM there is refused.
