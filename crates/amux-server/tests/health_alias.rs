@@ -93,6 +93,14 @@ async fn exhausted_read_pool_keeps_health_identity_and_runtime_responsive() {
         }
     }
     assert!(!held.is_empty());
+    // try_read grows a pool with spare capacity, so a None here must mean the
+    // pool is at max_size; an early stop fails with a count instead of letting
+    // the 503 assertion below flake on a half-drained pool.
+    assert!(
+        store.try_read().is_none(),
+        "drain stopped with capacity left after {} connections",
+        held.len()
+    );
     // Simulate fleet work borrowing every connection. A real OS thread releases
     // them even if the old synchronous health handler blocks the entire runtime.
     let release = std::thread::spawn(move || {

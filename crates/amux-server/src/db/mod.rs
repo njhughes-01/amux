@@ -103,6 +103,11 @@ pub struct WriteReply {
     pub events: Vec<StateEvent>,
 }
 
+/// How long `Store::try_read` may spend opening a NEW pooled connection when
+/// none is idle but the pool is below max_size. Well inside the 250 ms health
+/// probe budget, so a genuinely stuck open still reports rather than hangs.
+const TRY_READ_GROW_WAIT: std::time::Duration = std::time::Duration::from_millis(50);
+
 /// Handle to the store: cheap to clone, shared across the router and
 /// background jobs.
 #[derive(Clone)]
@@ -446,8 +451,21 @@ impl Store {
     }
 
     /// Health must report pool exhaustion without waiting behind fleet probes.
+    ///
+    /// CAPACITY-AWARE since min_idle(1) (AMUX-4739): `try_get` only hands out
+    /// an IDLE connection, and with a one-connection floor the pool usually has
+    /// none idle while it still has room to open more. Reading that as
+    /// "exhausted" made /health say 503 store "hung" on a healthy store. So a
+    /// miss with spare capacity opens one, bounded by `TRY_READ_GROW_WAIT`; only
+    /// a pool already at max_size is exhausted.
     pub fn try_read(&self) -> Option<r2d2::PooledConnection<SqliteConnectionManager>> {
-        self.read_pool.try_get()
+        if let Some(conn) = self.read_pool.try_get() {
+            return Some(conn);
+        }
+        if self.read_pool.state().connections < self.read_pool.max_size() {
+            return self.read_pool.get_timeout(TRY_READ_GROW_WAIT).ok();
+        }
+        None
     }
 
     /// Open a read-only connection outside the request pool for a bounded,
@@ -705,6 +723,26 @@ mod amux4739_pool_startup_tests {
     /// broken database. Measured on an unmodified origin/main, one full lib run
     /// produced 39 of these across modules sharing nothing but this call, and a
     /// second run failed a different set, which is why it read as flakiness.
+    /// The health probe's `try_read` must GROW a pool that has room rather
+    /// than call it exhausted: with min_idle(1) the idle set is usually empty.
+    #[test]
+    fn try_read_grows_a_pool_with_spare_capacity_and_only_fails_at_max_size() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("grow.db")).unwrap();
+        let max = store.read_pool.max_size() as usize;
+        let mut held = Vec::new();
+        while held.len() < max {
+            let c = store.try_read();
+            assert!(
+                c.is_some(),
+                "try_read refused with {} of {max} connections held — spare capacity read as exhausted",
+                held.len()
+            );
+            held.push(c);
+        }
+        assert!(store.try_read().is_none(), "a pool at max_size must report exhausted");
+    }
+
     #[test]
     fn opening_the_store_waits_for_one_connection_not_the_whole_pool() {
         let dir = tempfile::tempdir().unwrap();
