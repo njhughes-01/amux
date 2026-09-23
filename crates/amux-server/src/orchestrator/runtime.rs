@@ -603,16 +603,40 @@ impl Runtime {
         let earliest_event: Option<String> = conn.query_row(
             "SELECT MIN(at) FROM _amux_state_events",
             [], |r| r.get(0))?;
-        let earliest_event = earliest_event
-            .map(|at| at.parse::<DateTime<Utc>>())
-            .transpose()?;
+        let earliest_event = earliest_event.and_then(|at| {
+            at.parse::<DateTime<Utc>>()
+                .map_err(|e| tracing::warn!(error = %e, "unparseable _amux_state_events.at; no-progress stays unjudged"))
+                .ok()
+        });
+        // A close admits a probe (`can_recover`), so no-progress is judged
+        // again only once a full window has elapsed since that close — the
+        // same fair chance `window_elapsed` gives a newly started server. The
+        // window still holds zero completions on the very next tick, so
+        // without this the breaker re-tripped, re-closed and flipped every
+        // tick (4,072 NoProgress opens in one day on Spinx), each flip a
+        // store write through publish_fleet_state.
+        let last_close: Option<String> = {
+            use rusqlite::OptionalExtension;
+            conn.query_row(
+                "SELECT updated_at FROM _amux_fleet_state
+                 WHERE singleton = 1 AND json_extract(state, '$.kind') = 'normal'",
+                [], |r| r.get(0)).optional()?
+        };
+        // Unparseable reads as "no close": the old flapping at worst, never a
+        // failed tick that halts planning.
+        let last_close = last_close.and_then(|at| {
+            at.parse::<DateTime<Utc>>()
+                .map_err(|e| tracing::warn!(error = %e, "unparseable _amux_fleet_state.updated_at; ignoring last close"))
+                .ok()
+        });
         Ok(amux_core::circuit::WindowStats {
             tokens_spent,
             tasks_completed: completed,
             failures: attempt_failures.saturating_add(verification_failures),
             all_items_blocked: has_live_work && !runnable_or_assigned,
             has_live_work,
-            window_elapsed: earliest_event.is_some_and(|at| at <= cutoff_at),
+            window_elapsed: earliest_event.is_some_and(|at| at <= cutoff_at)
+                && last_close.is_none_or(|at| at <= cutoff_at),
         })
     }
 
@@ -2410,6 +2434,61 @@ mod adherence_tests {
             .unwrap();
         let sem = out.lock().unwrap().clone();
         sem
+    }
+
+    fn fleet_kind(runtime: &Runtime) -> &'static str {
+        use amux_core::circuit::{CircuitOpenReason, FleetState};
+        match &*runtime.fleet_state.lock().unwrap() {
+            FleetState::Normal => "normal",
+            FleetState::CircuitOpen { reason: CircuitOpenReason::NoProgress { .. }, .. } => "open:no_progress",
+            FleetState::CircuitOpen { .. } => "open:other",
+            FleetState::Reconciling { .. } => "reconciling",
+        }
+    }
+
+    #[tokio::test]
+    async fn no_progress_probe_close_holds_for_a_window_instead_of_flapping() {
+        let store = store();
+        seed_issue(&store, "live work with no completions", "nobody", "todo");
+        let old = (Utc::now() - chrono::Duration::hours(2)).to_rfc3339();
+        store
+            .write(move |conn| {
+                conn.execute(
+                    "INSERT INTO _amux_state_events(rev,entity_type,entity_id,mutation,at)
+                     VALUES(1,'task','seed','{}',?1)",
+                    params![old],
+                )?;
+                Ok(WriteOutcome { applied: true, events: vec![] })
+            })
+            .unwrap();
+        let mut rt = runtime(store.clone(), None, false);
+        rt.breaker.min_progress_per_window = 1;
+
+        rt.tick_once(false).await.unwrap();
+        assert_eq!(fleet_kind(&rt), "open:no_progress", "a full window with no completions trips");
+        rt.tick_once(false).await.unwrap();
+        assert_eq!(fleet_kind(&rt), "normal", "runnable work admits a probe");
+        for _ in 0..3 {
+            rt.tick_once(false).await.unwrap();
+            assert_eq!(fleet_kind(&rt), "normal", "the probe gets a full window, not one tick");
+        }
+        assert_eq!(
+            count(&store, r#"SELECT COUNT(*) FROM _amux_state_events WHERE entity_id LIKE '{"kind":%'"#),
+            2,
+            "one open and one close were published, no per-tick flips"
+        );
+
+        // Positive control: once a full window has passed since the close,
+        // a still-stalled fleet trips again.
+        let expired = (Utc::now() - chrono::Duration::hours(2)).to_rfc3339();
+        store
+            .write(move |conn| {
+                conn.execute("UPDATE _amux_fleet_state SET updated_at=?1 WHERE singleton=1", params![expired])?;
+                Ok(WriteOutcome { applied: true, events: vec![] })
+            })
+            .unwrap();
+        rt.tick_once(false).await.unwrap();
+        assert_eq!(fleet_kind(&rt), "open:no_progress", "no progress after the probe window re-trips");
     }
 
     fn runtime(store: SharedStore, protocol: Option<Arc<MockProtocol>>, pickup: bool) -> Runtime {
