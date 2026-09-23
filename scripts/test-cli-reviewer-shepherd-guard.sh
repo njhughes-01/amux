@@ -52,6 +52,10 @@ class H(http.server.BaseHTTPRequestHandler):
             name = self.path.rsplit("/", 1)[-1]
             if name in SESSIONS:
                 self._json(200, SESSIONS[name])
+            elif name == "store-down-session":
+                self._json(503, {"error": "worker routing lookup unavailable; command not executed"})
+            elif name == "rust-worker-session":
+                self._json(501, {"error": "rust-managed worker — use /api/workers"})
             else:
                 self._json(404, {"error": f"session '{name}' not found"})
             return
@@ -121,6 +125,18 @@ for verb in reviewer shepherd; do
   else
     bad "$verb: archived-but-not-isolated is set, with a warning" "rc=$RC body=$(patch_body) out=$OUT"
   fi
+
+  # A server that could not answer is "could not tell", never "does not exist":
+  # the 503 (store lookup failed) and 501 (rust-managed worker) bodies also
+  # carry `error`, and refusing on them would lock a real peer out.
+  for who in store-down-session rust-worker-session; do
+    run "$verb" TEST-1 "$who"
+    if [ "$RC" -eq 0 ] && patched && [[ "$OUT" == *"could not confirm"* ]]; then
+      ok "$verb: a $who error body warns as unknown and still sets the field"
+    else
+      bad "$verb: a $who error body warns as unknown and still sets the field" "rc=$RC body=$(patch_body) out=$OUT"
+    fi
+  done
 
   run "$verb" TEST-1 none
   if [ "$RC" -eq 0 ] && patched; then

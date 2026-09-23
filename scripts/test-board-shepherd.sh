@@ -30,8 +30,10 @@ if [[ $is_patch -eq 1 ]]; then
   echo '{"ok":true,"id":"TEST-1","shepherd":"peer-lane"}'
 elif [[ "$*" == *"/api/sessions/ghost-lane"* ]]; then
   # A peer the fleet has never heard of: `_board_assignee_state` prints
-  # "missing" when the payload has no `name`, and the guard must die.
-  echo '{"error":"no such session"}'
+  # "missing" for the server's 404 not-found body, and the guard must die.
+  # The server's real 404 body (session_verbs.rs): only this shape means
+  # "does not exist"; other error bodies (503/501) are "could not tell".
+  echo '{"error":"session '"'"'ghost-lane'"'"' not found"}'
 elif [[ "$*" == *"/api/sessions/"* ]]; then
   # `_board_assignee_guard` probes the peer before any PATCH and needs a
   # `name` back; it also refuses on `isolated` or `archived`. Returning the

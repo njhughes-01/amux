@@ -2074,8 +2074,15 @@ except Exception:
     print("unknown:unparseable response"); sys.exit()
 if not isinstance(d, dict):
     print("unknown:unparseable response"); sys.exit()
-if d.get("error") or "name" not in d:
+err = d.get("error")
+if isinstance(err, str) and err.startswith("session ") and err.endswith(" not found"):
     print("missing"); sys.exit()
+if err:
+    # 503 (store/sessions lookup failed) and 501 (rust-managed worker) also carry
+    # an `error`; they are "could not tell", never "does not exist".
+    print("unknown:" + str(err)[:80]); sys.exit()
+if "name" not in d:
+    print("unknown:no name in response"); sys.exit()
 if d.get("isolated"):
     print("isolated"); sys.exit()
 if d.get("archived"):
