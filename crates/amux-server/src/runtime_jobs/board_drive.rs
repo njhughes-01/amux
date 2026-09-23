@@ -1939,6 +1939,8 @@ fn drainable_backlog_rows(conn: &Connection, session: &str, now: f64) -> rusqlit
            AND NOT {CAPTURE} \
            AND NOT EXISTS (SELECT 1 FROM issue_tags t WHERE t.issue_id=i.id \
                            AND lower(t.tag) LIKE 'needs:you%') \
+           AND NOT EXISTS (SELECT 1 FROM issue_tags t WHERE t.issue_id=i.id \
+                           AND lower(t.tag) = 'defer:focused') \
            AND NOT EXISTS (SELECT 1 FROM session_events e WHERE e.type='task.claimed' \
                            AND e.ts > ?2 AND e.data LIKE '%\"' || i.id || '\"%') \
            AND NOT (COALESCE(i.source_ref,'') <> '' AND COALESCE(i.last_verified_at,0) > ?3) \
@@ -2011,6 +2013,21 @@ fn drainable_backlog_count(conn: &Connection, session: &str, now: f64) -> usize 
 /// CANNOT serve this purpose — `source_ref` is on 93% of backlog cards and a
 /// future `due` on 65%, because both are auto-populated, so excluding on either
 /// would silence ~65% of the drain (AF-514).
+///
+/// A `defer:focused` TAG is excluded for the same reason (AF-514, decided:
+/// option 1, "a tag... excluded by drainable_backlog_ids the way `needs:you`
+/// already is"). mixpeek-studio's MS-1331/MS-1314/MS-1275 each auto-drained
+/// 3+ times a day and re-parked each time: their real deferral horizon is
+/// weeks, but the only existing lever with any teeth (`source_ref` +
+/// `last_verified_at` within `SOURCE_REF_STALE_S`, 24h) caps the honest
+/// horizon at a day, so they had to re-affirm daily and each affirmation cost
+/// a drain-and-re-park cycle. A tag is rare by construction the same way
+/// `blocked_on` is: nothing sets it by default, a lane sets it deliberately
+/// per card, and setting it costs nothing but is never automatic — unlike
+/// `source_ref`/`due`, which amux itself populates on most backlog cards
+/// regardless of intent. `PATCH /api/board/<ID>` with `{"tags":[...,
+/// "defer:focused"]}` (or without it, to clear) is the whole interface; no
+/// new column, no new verb, no CLI shorthand yet.
 fn oldest_drainable_backlog(conn: &Connection, session: &str, now: f64, continuation_gate: bool) -> Option<String> {
     drainable_backlog_ids(conn, session, now).into_iter().find(|id| {
         !continuation_gate || bs::get_issue(conn, id).ok().flatten().is_some_and(|row|
@@ -2173,7 +2190,7 @@ fn blocked_card_is_releasable(conn: &Connection, row: &bs::IssueRow) -> bool {
         && row.archived == 0
         && !row.depends_on.is_empty()
         && row.blocked_on.as_deref().map(str::trim).unwrap_or("").is_empty()
-        && !parked_on_live_trigger(row)
+        && !parked_on_live_trigger(row, crate::runtime_jobs::registry::unix_now() as i64)
         && deps_blocking(conn, row).is_empty()
 }
 
@@ -2228,11 +2245,33 @@ pub(crate) async fn unblock_resolved_blocked(state: &AppState) -> usize {
     moved
 }
 
-fn parked_on_live_trigger(row: &bs::IssueRow) -> bool {
-    row.source_ref
+/// A trigger holds a deps-cleared card only while the owner has verified it
+/// within `SOURCE_REF_STALE_S`. Until 2026-09-20 this tested only that
+/// `source_ref` was non-empty, so a ref nobody had looked at in weeks outranked
+/// "every dependency is done" forever. Measured on the live board that day: of
+/// the 13 backlog cards the store's own resolution rule called releasable, 10
+/// carried a source_ref, every one unverified for over 24h, and the promotion
+/// arm released none of them; fleet-wide 771 of the 837 backlog cards with a
+/// source_ref were stale, so the arm reached almost nothing (MB-53).
+///
+/// The MG-1388 protection survives: a deliberate re-park bumps
+/// `last_verified_at`, which makes the trigger fresh again and holds the card.
+fn parked_on_live_trigger(row: &bs::IssueRow, now: i64) -> bool {
+    fresh_source_ref_trigger(row, now)
+}
+
+/// Age in seconds of a source_ref the owner has NOT verified within
+/// `SOURCE_REF_STALE_S`, for the promotion log line. `None` when there is no
+/// trigger or it is fresh. A never-verified ref reports its age as `i64::MAX`.
+fn stale_trigger_age(row: &bs::IssueRow, now: i64) -> Option<i64> {
+    let has_ref = row
+        .source_ref
         .as_deref()
-        .map(str::trim)
-        .is_some_and(|s| !s.is_empty())
+        .is_some_and(|v| !v.trim().is_empty());
+    if !has_ref || fresh_source_ref_trigger(row, now) {
+        return None;
+    }
+    Some(row.last_verified_at.map_or(i64::MAX, |at| now - at))
 }
 
 /// Fleet-wide scan for the drive-to-verified pass: every agent-owned, live,
@@ -2295,7 +2334,8 @@ fn still_promotable(conn: &Connection, row: &bs::IssueRow, arm: PromoteArm) -> b
     }
     match arm {
         PromoteArm::DepsCleared => {
-            !parked_on_live_trigger(row) && promotable_deps(conn, row).is_some()
+            !parked_on_live_trigger(row, crate::runtime_jobs::registry::unix_now() as i64)
+                && promotable_deps(conn, row).is_some()
         }
         // A REVISIT DATE OUTRANKS A `source_ref` TRIGGER, deliberately.
         //
@@ -2436,7 +2476,7 @@ fn backlog_due_promotions(conn: &Connection) -> (Vec<String>, usize) {
     (due_drain_plan(&pairs, &todo_depth, drain_todo_ceiling()), due_total)
 }
 
-fn backlog_dep_promotions(conn: &Connection) -> (Vec<(String, Vec<String>)>, usize) {
+fn backlog_dep_promotions(conn: &Connection, now: i64) -> (Vec<(String, Vec<String>)>, usize) {
     let rows = bs::list_issues(
         conn,
         &["backlog".to_string()],
@@ -2462,11 +2502,22 @@ fn backlog_dep_promotions(conn: &Connection) -> (Vec<(String, Vec<String>)>, usi
         let Some(deps) = promotable_deps(conn, &r) else {
             continue;
         };
-        // The owner's own trigger OVERRIDES terminal deps — hold the card, and
-        // count the hold so the promotion pass leaving it parked is visible.
-        if parked_on_live_trigger(&r) {
+        // The owner's own FRESH trigger OVERRIDES terminal deps — hold the card,
+        // and count the hold so the promotion pass leaving it parked is visible.
+        if parked_on_live_trigger(&r, now) {
             held_on_trigger += 1;
             continue;
+        }
+        // A stale trigger no longer holds the card. Say so, with the age, so a
+        // promotion past a ref the owner meant to keep is self-announcing.
+        if let Some(age) = stale_trigger_age(&r, now) {
+            let age_h = if age == i64::MAX { -1 } else { age / 3600 };
+            tracing::info!(
+                target: "amux::board_drive", card = %r.id, trigger_age_h = age_h,
+                measured = true, n_considered = 1, verdict = "trigger_stale_promoted",
+                "board_drive: source_ref unverified past {}h no longer holds a deps-cleared backlog card (MB-53)",
+                SOURCE_REF_STALE_S / 3600
+            );
         }
         promotions.push((r.id.clone(), deps));
     }
@@ -2487,8 +2538,9 @@ fn backlog_dep_promotions(conn: &Connection) -> (Vec<(String, Vec<String>)>, usi
 /// that cleared it (two-fixes: the next promotion — or a wrongful one — is
 /// self-announcing).
 pub(crate) async fn promote_ready_backlog(state: &AppState) -> (usize, usize) {
+    let now = crate::runtime_jobs::registry::unix_now() as i64;
     let (candidates, held_on_trigger) = match state.store.read() {
-        Ok(conn) => backlog_dep_promotions(&conn),
+        Ok(conn) => backlog_dep_promotions(&conn, now),
         Err(_) => return (0, 0),
     };
     let mut promoted = 0;
@@ -6472,11 +6524,31 @@ fn blocker_recoveries_with_policy(conn: &Connection, lane: &str, allowed_asks: &
             bs::get_issue(conn, id).map(|dep| dep.map(|d|
                 json!({"id":d.id,"status":d.status,"evidence":d.evidence,"acceptance_criteria":d.acceptance_criteria})))
         }).collect::<rusqlite::Result<Vec<_>>>()?;
-        // Progress-note appends are not a changed blocker. Re-arm only for a
-        // changed execution contract, input evidence or blocking condition.
-        let signature = json!([lane,row.id,row.title,row.item_type,row.status,row.next_action,
-            row.acceptance_criteria,row.gate,row.evidence,row.depends_on,row.blocked_on,row.source_ref,row.waiting_on,
-            row.ask_type,row.ask_question,row.ask_unblocks,allowed_asks,dep_state]);
+        // THE KEY IS THE BLOCKER, NOT THE CARD (AMUX-4912). This used to hash
+        // next_action, acceptance_criteria, gate, evidence, ask_question and
+        // ask_unblocks, which are precisely the fields the recovery prompt
+        // tells the worker to write. So COMPLIANCE ROTATED THE KEY: the worker
+        // did as instructed, the hash moved, the dedupe missed, and the
+        // identical blocker was re-delivered. The only way to stop the loop was
+        // to stop recording state, the opposite of the instruction. Measured by
+        // mixpeek-fanout: 5 prompts on MF-1238 and 2 on MFEM1-55 against a
+        // byte-identical blocker, each ~53s after the worker updated the card,
+        // over a static approval hold that no re-prompt could unstick.
+        //
+        // It also made two statements in this file false. The prompt closes
+        // with "An unchanged blocker will not receive another recovery prompt",
+        // and that is now true.
+        //
+        // What remains is exactly what the eligibility test above reads:
+        // blocking deps, blocked_on, the trigger, whether next_action is
+        // MISSING, and whether the ask sits outside policy. next_action is the
+        // boolean rather than the text on purpose, so supplying it re-arms ONCE
+        // (the blocker genuinely cleared) and editing the wording afterwards
+        // never does. Progress notes, evidence and criteria are the worker's
+        // record of the same blocker, not a different one.
+        let signature = json!([lane,row.id,row.item_type,row.status,missing_next,
+            row.depends_on,row.blocked_on,row.source_ref,row.waiting_on,
+            row.ask_type,ask_outside_policy,allowed_asks,dep_state]);
         let identity = format!("board-blocker:{:x}", Sha256::digest(signature.to_string().as_bytes()));
         let context = json!({"card":row.id,"title":row.title,"status":row.status,
             "blocked_on":row.blocked_on,"trigger":row.source_ref,"waiting_on":row.waiting_on,
@@ -9601,11 +9673,23 @@ mod tests {
         ins("FREE", "blocked", "[\"DONE-DEP\"]", None, None);
         ins("WATCHED", "blocked", "[\"DONE-DEP\"]", Some("vendor ships the fix"), None);
         ins("TRIGGERED", "blocked", "[\"DONE-DEP\"]", None, Some("staging deploy is green"));
+        // A trigger holds only while the owner has verified it recently (MB-53).
+        conn.execute(
+            "UPDATE issues SET last_verified_at=?1 WHERE id='TRIGGERED'",
+            [now_f64() as i64],
+        )
+        .unwrap();
+        ins("STALE-TRIGGER", "blocked", "[\"DONE-DEP\"]", None, Some("staging deploy is green"));
+        conn.execute(
+            "UPDATE issues SET last_verified_at=?1 WHERE id='STALE-TRIGGER'",
+            [now_f64() as i64 - 30 * 24 * 3600],
+        )
+        .unwrap();
         ins("STILL", "blocked", "[\"OPEN-DEP\"]", None, None);
         ins("PROSE", "blocked", "[]", None, None);
         let got: Vec<String> = blocked_dep_unblocks(&conn).into_iter().map(|(id, _)| id).collect();
-        assert_eq!(got, vec!["FREE".to_string()],
-            "only a card whose dependencies were the whole block is released");
+        assert_eq!(got, vec!["FREE".to_string(), "STALE-TRIGGER".to_string()],
+            "a card whose dependencies were the whole block is released, and a trigger nobody has verified in 30 days no longer counts as a block (MB-53)");
     }
 
     #[tokio::test]
@@ -9728,6 +9812,79 @@ mod tests {
             Ok(crate::db::WriteOutcome{applied:true,events:vec![]})
         }).unwrap();
         assert_ne!(blocker_recoveries(&store.read().unwrap(), "lane").unwrap()[0].identity, identity);
+    }
+
+    #[test]
+    fn complying_with_the_recovery_prompt_does_not_re_arm_it() {
+        // AMUX-4912. The prompt demands next_action, acceptance_criteria and
+        // evidence, and the signature hashed all three, so doing as instructed
+        // rotated the key and the SAME blocker came back. Measured by
+        // mixpeek-fanout: 5 prompts on one card, each ~53s after an update, over
+        // a static approval hold no re-prompt could unstick.
+        let home = tempfile::tempdir().unwrap();
+        let _home = crate::api::settings::test_env::set_home(home.path());
+        let (_dir, _state, store) = drive_state();
+        drive_card(&store, "HELD", "backlog", "agent", "code");
+        store.write(|conn| {
+            conn.execute("UPDATE issues SET blocked_on='one IAM binding, grantable only by the owner' WHERE id='HELD'", [])?;
+            Ok(crate::db::WriteOutcome{applied:true,events:vec![]})
+        }).unwrap();
+        let identity = blocker_recoveries(&store.read().unwrap(), "lane").unwrap()[0].identity.clone();
+        // Every field the prompt tells the worker to write, in one turn.
+        store.write(|conn| {
+            conn.execute(
+                "UPDATE issues SET next_action='Ask the owner to grant the binding, then retry',\
+                 acceptance_criteria='[\"the binding exists on the service account\"]',\
+                 evidence='checked 09:00 and 11:00; still absent',\
+                 gate='[\"Implemented and merged\"]',\
+                 ask_question='grant the binding?',ask_unblocks='the tenant roll',\
+                 title='Held on one IAM binding',rev=rev+1 WHERE id='HELD'", [])?;
+            Ok(crate::db::WriteOutcome{applied:true,events:vec![]})
+        }).unwrap();
+        assert_eq!(
+            blocker_recoveries(&store.read().unwrap(), "lane").unwrap()[0].identity, identity,
+            "recording exactly what the prompt demanded re-armed the prompt"
+        );
+        // A genuinely different blocking condition still earns a turn.
+        store.write(|conn| {
+            conn.execute("UPDATE issues SET blocked_on='binding granted; the roll now fails on quota' WHERE id='HELD'", [])?;
+            Ok(crate::db::WriteOutcome{applied:true,events:vec![]})
+        }).unwrap();
+        assert_ne!(
+            blocker_recoveries(&store.read().unwrap(), "lane").unwrap()[0].identity, identity,
+            "a changed blocking condition must still re-arm"
+        );
+    }
+
+    #[test]
+    fn supplying_a_missing_continuation_re_arms_once_then_settles() {
+        // AMUX-4912. next_action is hashed as the missing/present BOOLEAN the
+        // eligibility test reads, never as text: supplying it clears a real
+        // blocker and legitimately earns ONE turn, and rewording it afterwards
+        // earns none.
+        let home = tempfile::tempdir().unwrap();
+        let _home = crate::api::settings::test_env::set_home(home.path());
+        let (_dir, _state, store) = drive_state();
+        drive_card(&store, "NOCONT", "backlog", "agent", "code");
+        store.write(|conn| {
+            conn.execute("UPDATE issues SET blocked_on='waiting on an upstream artifact',next_action=NULL WHERE id='NOCONT'", [])?;
+            Ok(crate::db::WriteOutcome{applied:true,events:vec![]})
+        }).unwrap();
+        let missing = blocker_recoveries(&store.read().unwrap(), "lane").unwrap()[0].identity.clone();
+        store.write(|conn| {
+            conn.execute("UPDATE issues SET next_action='Poll the upstream artifact, then validate it' WHERE id='NOCONT'", [])?;
+            Ok(crate::db::WriteOutcome{applied:true,events:vec![]})
+        }).unwrap();
+        let supplied = blocker_recoveries(&store.read().unwrap(), "lane").unwrap()[0].identity.clone();
+        assert_ne!(supplied, missing, "a missing continuation becoming present IS a changed blocker");
+        store.write(|conn| {
+            conn.execute("UPDATE issues SET next_action='Poll the upstream artifact hourly, then validate its signature' WHERE id='NOCONT'", [])?;
+            Ok(crate::db::WriteOutcome{applied:true,events:vec![]})
+        }).unwrap();
+        assert_eq!(
+            blocker_recoveries(&store.read().unwrap(), "lane").unwrap()[0].identity, supplied,
+            "rewording a continuation that already exists is not a changed blocker"
+        );
     }
 
     #[test]
@@ -10988,6 +11145,67 @@ mod tests {
         assert_eq!(drainable_backlog_ids(&conn, "blk", now), vec!["BL-2".to_string()]);
     }
 
+    /// AF-514. mixpeek-studio's MS-1331/MS-1314/MS-1275 each auto-drained 3+
+    /// times a day: their real deferral horizon is weeks, but the only lever
+    /// with any teeth (`source_ref` + a `last_verified_at` inside
+    /// `SOURCE_REF_STALE_S`, 24h) capped what they could honestly express at
+    /// a day, so they had to re-affirm daily and each affirmation cost a
+    /// drain-and-re-park cycle. Measured on the live board before this: gating
+    /// on `source_ref` (93% of backlog) or a future `due` (65%) would each
+    /// silence most of the drain fleet-wide — a signal everything carries
+    /// cannot mark anything. `defer:focused` is rare by construction instead:
+    /// nothing sets it by default, so its own test does not need a "does this
+    /// silence the drain" control the way `blocked_on`'s does — a tag is
+    /// opt-in the same way `--on` naming a cause is.
+    #[test]
+    fn a_card_tagged_defer_focused_is_not_drainable_regardless_of_source_ref_or_due() {
+        let conn = board_db();
+        let now = now_f64();
+        add_card(&conn, "MS-1", "studio", "backlog", "large focused turn", "SCOPE: x");
+        tag(&conn, "MS-1", "defer:focused", now);
+        assert!(
+            drainable_backlog_ids(&conn, "studio", now).is_empty(),
+            "a defer:focused card must never be offered to the drain"
+        );
+
+        // THE POINT OF THIS CARD, pinned directly: neither existing lever
+        // changes the verdict, because neither is what is excluding it.
+        conn.execute(
+            "UPDATE issues SET source_ref='not needed for weeks', last_verified_at=?1, \
+             due=date('now') WHERE id='MS-1'",
+            rusqlite::params![now as i64],
+        )
+        .unwrap();
+        assert!(
+            drainable_backlog_ids(&conn, "studio", now).is_empty(),
+            "a fresh source_ref or an arrived due date must not override the tag"
+        );
+
+        // THE CONTROL: removing the tag (the only interface -- PATCH tags,
+        // no new column) makes it drainable again, same as any ordinary card.
+        // Also clears the fresh source_ref set above -- otherwise THAT lever
+        // alone would still exclude it, and this cell would prove nothing
+        // about the tag specifically.
+        conn.execute("DELETE FROM issue_tags WHERE issue_id='MS-1'", []).unwrap();
+        conn.execute("UPDATE issues SET source_ref='', last_verified_at=NULL WHERE id='MS-1'", []).unwrap();
+        assert_eq!(
+            drainable_backlog_ids(&conn, "studio", now),
+            vec!["MS-1".to_string()],
+            "clearing the tag must restore ordinary drain eligibility"
+        );
+
+        // AND A DIFFERENT TAG must not accidentally match -- this excludes an
+        // exact tag, not a prefix the way needs:you% does, so a lane naming
+        // something merely SIMILAR does not silently get the same exclusion.
+        add_card(&conn, "MS-2", "studio", "backlog", "unrelated work", "SCOPE: x");
+        tag(&conn, "MS-2", "defer:focused-ish", now);
+        assert_eq!(
+            drainable_backlog_ids(&conn, "studio", now),
+            vec!["MS-1".to_string(), "MS-2".to_string()],
+            "a tag that merely starts with defer:focused must not match the exact exclusion"
+        );
+    }
+
     #[test]
     fn nudge_population_uses_dispatch_rules_and_discloses_display_truncation() {
         let conn = board_db();
@@ -11240,7 +11458,7 @@ mod tests {
         )
         .unwrap();
 
-        let (got, _held) = backlog_dep_promotions(&conn);
+        let (got, _held) = backlog_dep_promotions(&conn, 1_000_000);
         let ids: std::collections::HashSet<&str> = got.iter().map(|(i, _)| i.as_str()).collect();
 
         assert!(ids.contains("P-all-terminal"), "all-terminal deps must promote: {ids:?}");
@@ -11274,10 +11492,27 @@ mod tests {
             [],
         )
         .unwrap();
-        // The MG-1388 shape: a terminal dep AND a live source_ref trigger.
+        // The MG-1388 shape: a terminal dep AND a live source_ref trigger, verified
+        // by the owner within the last 24h.
+        conn.execute(
+            "INSERT INTO issues (id,title,status,session,owner_type,type,depends_on,source_ref,last_verified_at,updated,created) \
+             VALUES ('T-armed','T-armed','backlog','me','agent','investigation','[\"A-done\"]',\
+                     'some namespace holds both an archive- and a competitor-shaped collection',999_000,100,100)",
+            [],
+        )
+        .unwrap();
+        // The MB-53 shape: the same trigger, last verified 30 days ago -> promotes.
+        conn.execute(
+            "INSERT INTO issues (id,title,status,session,owner_type,type,depends_on,source_ref,last_verified_at,updated,created) \
+             VALUES ('T-stale','T-stale','backlog','me','agent','investigation','[\"A-done\"]',\
+                     'some namespace holds both an archive- and a competitor-shaped collection',100,100,100)",
+            [],
+        )
+        .unwrap();
+        // And a trigger that was NEVER verified -> promotes.
         conn.execute(
             "INSERT INTO issues (id,title,status,session,owner_type,type,depends_on,source_ref,updated,created) \
-             VALUES ('T-armed','T-armed','backlog','me','agent','investigation','[\"A-done\"]',\
+             VALUES ('T-never','T-never','backlog','me','agent','investigation','[\"A-done\"]',\
                      'some namespace holds both an archive- and a competitor-shaped collection',100,100)",
             [],
         )
@@ -11297,9 +11532,17 @@ mod tests {
         )
         .unwrap();
 
-        let (got, held) = backlog_dep_promotions(&conn);
+        let (got, held) = backlog_dep_promotions(&conn, 1_000_000);
         let ids: std::collections::HashSet<&str> = got.iter().map(|(i, _)| i.as_str()).collect();
         assert!(!ids.contains("T-armed"), "a live-trigger park must NOT be promoted: {ids:?}");
+        assert!(
+            ids.contains("T-stale"),
+            "a trigger unverified for 30 days no longer holds a deps-cleared card (MB-53): {ids:?}"
+        );
+        assert!(
+            ids.contains("T-never"),
+            "a trigger that was never verified is not a live trigger (MB-53): {ids:?}"
+        );
         assert!(
             ids.contains("T-plain"),
             "a no-trigger terminal-deps card still promotes (guard not vacuous): {ids:?}"
@@ -11308,7 +11551,7 @@ mod tests {
             ids.contains("T-blank"),
             "a whitespace-only source_ref is not a live trigger: {ids:?}"
         );
-        assert_eq!(held, 1, "exactly the one live-trigger card is counted as held");
+        assert_eq!(held, 1, "exactly the one FRESH live-trigger card is counted as held");
     }
 
     /// AMUX-3777: the HELD-CARD re-nag arm, which had NO coverage at all.
