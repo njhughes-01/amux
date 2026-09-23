@@ -103,10 +103,86 @@ fn rewrite_legacy_uri(uri: &Uri) -> Option<Uri> {
     None
 }
 
+/// Drop a trailing slash when, and only when, the bare path IS a declared route
+/// (AMUX-4753).
+///
+/// # The fault
+///
+/// Every nested API root answers 200 bare and 404 on the slash, because they are
+/// mounted as `.nest("/api/x", Router::new().route("/", ..))` and axum 0.6
+/// dropped automatic trailing-slash redirects. Measured on build b971a3e9, 11 of
+/// 12 nested roots: `/api/board`, `/api/workers`, `/api/schedules`,
+/// `/api/memories`, `/api/groups`, `/api/board-lifecycle`, `/api/messages`,
+/// `/api/search`, `/api/why`, `/api/policy`, `/api/prefs`.
+///
+/// It is not cosmetic. Real clients send the slash form (12 GETs to
+/// `/api/board-lifecycle/` from Python-urllib/3.11 on 2026-09-15, every one a
+/// 404), and amux DISAGREED WITH ITSELF about it: the invariant matcher
+/// `match_route_full` trims slashes, so `route.mounted_routes_answer` judged
+/// `/api/board-lifecycle/` as a mounted route and failed it, while axum refused
+/// to serve it. Two components, one fact, opposite answers.
+///
+/// # Why the predicate is "is the bare path routed" rather than "ends in /"
+///
+/// A blanket strip is what `NormalizePathLayer` does, and it would reach
+/// surfaces this card is not about: the SPA shell fallback, the `{*path}` file
+/// servers, `/proxy/`. Asking [`super::request_log::routed_methods_at`] instead
+/// confines the rewrite to requests that would have matched a DECLARED route but
+/// for the slash, which is exactly the population the invariant matcher already
+/// counts as mounted. One fact, one definition, and the two consumers can no
+/// longer drift — the alternative fix (teach the matcher that a slash is not a
+/// mounted path) would have made them agree by leaving the real clients broken.
+///
+/// # Why a rewrite and not a 308
+///
+/// A redirect only helps a client that follows redirects, and Python's urllib
+/// only learned 308 in 3.11. A rewrite serves the request. The response carries
+/// `x-amux-canonical-path` so a client can still discover the canonical spelling
+/// without having to follow anything; that value is the resolved path, never the
+/// raw one the client sent.
+///
+/// Returns the rewritten URI, or `None` when nothing should change. `/` itself
+/// is never rewritten (it would become the empty path).
+fn trim_trailing_slash(uri: &Uri) -> Option<Uri> {
+    let path = uri.path();
+    let bare = path.strip_suffix('/').filter(|b| !b.is_empty())?;
+    // Only a path a declared route claims. An unrouted `/api/nope/` keeps its
+    // 404, with the catalog and nearest_routes it already gets.
+    if super::request_log::routed_methods_at(bare).is_empty() {
+        return None;
+    }
+    let new_pq = match uri.query() {
+        Some(q) => format!("{bare}?{q}"),
+        None => bare.to_string(),
+    };
+    let mut parts = uri.clone().into_parts();
+    parts.path_and_query = Some(new_pq.parse().ok()?);
+    Uri::from_parts(parts).ok()
+}
+
 async fn alias_middleware(mut req: Request, next: Next) -> Response {
     let rewritten = rewrite_legacy_uri(req.uri());
     let was_legacy = rewritten.is_some();
     if let Some(uri) = rewritten {
+        *req.uri_mut() = uri;
+    }
+    // AFTER the legacy rewrite, not before: `/api/issues/5/` has to become
+    // `/api/tasks/5` and only the canonical spelling is in ROUTE_TABLE, so a
+    // strip that ran first would find nothing routed and leave the 404 in place.
+    let canonical = trim_trailing_slash(req.uri());
+    if let Some(uri) = canonical.clone() {
+        let served = uri.path().to_string();
+        // THE TWO-FIX SIGNAL. The population is small by construction (a client
+        // has to send the slash form at all), and until now the only trace was a
+        // 404 in the request log that looked like a client guessing a URL. A
+        // sweep can now count who is on the slash form and which roots they want.
+        tracing::info!(
+            target: "amux::routing",
+            verdict = "trailing_slash_normalized",
+            sent = %req.uri().path(),
+            served = %served,
+            "a declared route was addressed with a trailing slash and was served rather than 404'd"
+        );
         *req.uri_mut() = uri;
     }
     let mut res = next.run(req).await;
@@ -114,6 +190,12 @@ async fn alias_middleware(mut req: Request, next: Next) -> Response {
         // The rename announces itself instead of breaking callers.
         res.headers_mut()
             .insert("deprecated", HeaderValue::from_static("true"));
+    }
+    if let Some(uri) = canonical {
+        // Server-resolved, never the raw path the client sent.
+        if let Ok(v) = HeaderValue::from_str(uri.path()) {
+            res.headers_mut().insert("x-amux-canonical-path", v);
+        }
     }
     res
 }
@@ -378,6 +460,94 @@ mod tests {
         let (st, _, body) = fetch(&app, "/api/issues/5/echo?lines=600&x=1").await;
         assert_eq!(st, StatusCode::OK);
         assert_eq!(body, "lines=600&x=1");
+    }
+
+    // ---- trailing slash (AMUX-4753) -------------------------------------
+
+    /// The predicate is "is the bare path a DECLARED route", not "ends with a
+    /// slash". A blanket strip would reach the SPA shell, the `{*path}` file
+    /// servers and `/proxy/`, none of which this card is about.
+    #[test]
+    fn only_a_routed_bare_path_loses_its_slash() {
+        let u = |s: &str| s.parse::<Uri>().unwrap();
+        // A real nested root: the whole subject of the card.
+        assert_eq!(trim_trailing_slash(&u("/api/board/")).unwrap().path(), "/api/board");
+        assert_eq!(
+            trim_trailing_slash(&u("/api/board-lifecycle/")).unwrap().path(),
+            "/api/board-lifecycle"
+        );
+        // Query survives.
+        let rewritten = trim_trailing_slash(&u("/api/board/?all=1&slim=0")).unwrap();
+        assert_eq!(rewritten.path(), "/api/board");
+        assert_eq!(rewritten.query(), Some("all=1&slim=0"));
+
+        // NOT ROUTED: the 404 stays, with the catalog and nearest_routes it
+        // already gets. This is the leg that fails on a blanket strip.
+        assert!(trim_trailing_slash(&u("/api/definitely-not-a-route/")).is_none());
+        // THE ROOT. Stripping it would leave the empty path.
+        assert!(trim_trailing_slash(&u("/")).is_none());
+        // Nothing to strip.
+        assert!(trim_trailing_slash(&u("/api/board")).is_none());
+    }
+
+    #[tokio::test]
+    async fn a_declared_route_answers_the_same_with_or_without_the_slash() {
+        let app = demo_app();
+        let (bare, _, bare_body) = fetch(&app, "/api/workers").await;
+        let (slash, _, slash_body) = fetch(&app, "/api/workers/").await;
+        assert_eq!(bare, StatusCode::OK);
+        assert_eq!(slash, bare, "the slash form 404'd while the bare path answered");
+        assert_eq!(slash_body, bare_body, "the two spellings must reach one handler");
+
+        // An unrouted path keeps its 404: the fix is not "never 404 on a slash".
+        let (st, _, _) = fetch(&app, "/api/nope/").await;
+        assert_eq!(st, StatusCode::NOT_FOUND);
+    }
+
+    /// The legacy rewrite runs FIRST, and this pins why.
+    ///
+    /// The combination has no live specimen today and the test says so rather
+    /// than manufacturing one: `/api/issues` aliases to `/api/tasks`, which is
+    /// mounted nowhere (both spellings 404 on the running server) and is absent
+    /// from ROUTE_TABLE. So the two halves that ARE true now are pinned instead,
+    /// and together they are the argument for the order.
+    #[test]
+    fn the_slash_is_trimmed_after_the_legacy_rewrite_not_before() {
+        let u = |s: &str| s.parse::<Uri>().unwrap();
+        // The alias carries a trailing slash through rather than eating it, so
+        // there is still something for the strip to do afterwards.
+        assert_eq!(rewrite_legacy_uri(&u("/api/issues/5/")).unwrap().path(), "/api/tasks/5/");
+        // And the strip refuses a path ROUTE_TABLE does not declare. Running it
+        // first would therefore find nothing routed at the LEGACY spelling and
+        // leave a legacy-plus-slash request 404ing, whichever way round the
+        // alias target is eventually mounted.
+        assert!(trim_trailing_slash(&u("/api/issues/5/")).is_none());
+    }
+
+    async fn canonical_header(app: &Router, path: &str) -> Option<String> {
+        let res = app
+            .clone()
+            .oneshot(HttpRequest::builder().uri(path).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        res.headers()
+            .get("x-amux-canonical-path")
+            .map(|v| v.to_str().unwrap().to_string())
+    }
+
+    #[tokio::test]
+    async fn the_canonical_path_is_named_on_the_response_and_only_when_rewritten() {
+        let app = demo_app();
+        assert_eq!(
+            canonical_header(&app, "/api/workers/").await.as_deref(),
+            Some("/api/workers"),
+            "a rewritten request must be able to tell the client the canonical spelling"
+        );
+        assert_eq!(
+            canonical_header(&app, "/api/workers").await,
+            None,
+            "a request that was already canonical must not be annotated"
+        );
     }
 
     #[tokio::test]
