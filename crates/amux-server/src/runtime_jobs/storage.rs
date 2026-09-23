@@ -1022,21 +1022,125 @@ pub fn rotate_session_logs(logs_dir: &Path) -> (usize, u64) {
 // Periodic VACUUM
 // ---------------------------------------------------------------------------
 
+/// Truncate the WAL on EVERY tick, independent of VACUUM (AMUX-4811).
+///
+/// The only `wal_checkpoint(TRUNCATE)` used to live inside `maybe_vacuum`,
+/// which the caller invokes only when `total_deleted > 0` and which then
+/// refuses unless 24h have passed. So on any tick where retention deleted
+/// nothing, the WAL was never truncated at all. The comment at that call site
+/// already said "the WAL checkpoint is cheap, full VACUUM is not"; this splits
+/// them so the cheap half runs on the cheap schedule.
+///
+/// It matters because the default 1000-page autocheckpoint runs in PASSIVE
+/// mode: it gives up immediately when any reader is active and does not shrink
+/// the file even when it succeeds. With ~42 lanes polling the API there is
+/// nearly always a reader, so passive checkpoints rarely complete. Measured
+/// upstream 2026-09-18: a 4.16 GB database carrying a 150,025,712 B WAL, about
+/// 9 MB/hour that autocheckpoint never reclaimed.
+///
+/// The WAL measured is the one beside the database the store actually opened
+/// (`Connection::path`), not a guessed name under the amux home. The database
+/// path comes from configuration (`AMUX_DB`), and a guessed path would read
+/// `None` on both sides and log nothing, hiding a checkpoint that ran.
+///
+/// Returns (before, after) so the caller can publish both. A checkpoint that
+/// ran and freed nothing is a different fact from one that never ran, and only
+/// reporting both tells them apart (ethos rule 4).
+/// Returns (WAL bytes before, WAL bytes after, blocked). `blocked` is the
+/// checkpoint's own verdict: SQLite reports a TRUNCATE held off by a reader or
+/// the writer as a RESULT ROW with busy=1, not as an error, so it is read from
+/// that row rather than inferred from sizes (`None` when the pragma did not run).
+async fn checkpoint_wal(store: &crate::db::SharedStore) -> (Option<u64>, Option<u64>, Option<bool>) {
+    let t0 = std::time::Instant::now();
+    // `read_async`, NOT `write_async`, and that is the whole fix.
+    //
+    // Every write_async closure runs inside an Immediate transaction
+    // (`apply_write` in db/mod.rs), and SQLite refuses a checkpoint inside one:
+    // `wal_checkpoint(TRUNCATE) failed error=database table is locked`.
+    // read_async hands out a POOLED connection that is not in a transaction.
+    //
+    // On this fork those pooled connections ARE read-only: `Store::open` sets
+    // `query_only=ON` on every one. (Upstream's comment here said they were
+    // read-write; that is not true here.) SQLite still allows a checkpoint
+    // under query_only, and `checkpoint_wal_truncates_through_the_store_read_pool`
+    // proves it against a real `Store`. VACUUM is NOT allowed; see maybe_vacuum.
+    let res = store
+        .read_async(|conn| {
+            let wal = conn
+                .path()
+                .filter(|p| !p.is_empty())
+                .map(|p| std::path::PathBuf::from(format!("{p}-wal")));
+            let size = || wal.as_ref().and_then(|w| std::fs::metadata(w).ok()).map(|m| m.len());
+            let before = size();
+            let ran = conn
+                .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |r| r.get::<_, i64>(0))
+                .map(|busy| busy != 0)
+                .map_err(|e| e.to_string());
+            let after = size();
+            Ok((before, ran, after))
+        })
+        .await;
+    let (before, after, res) = match res {
+        Ok((b, ran, a)) => (b, a, ran),
+        Err(e) => (None, None, Err(e.to_string())),
+    };
+    let blocked = res.as_ref().ok().copied();
+    match res {
+        Ok(true) => tracing::warn!(
+            before_bytes = ?before, after_bytes = ?after,
+            took_ms = t0.elapsed().as_millis() as u64,
+            "storage sweep: wal_checkpoint(TRUNCATE) was BLOCKED (busy=1) — a reader or \
+             the writer held it past busy_timeout; the WAL was not truncated (AMUX-4811)"
+        ),
+        Ok(false) => {
+            // Two-fix rule: when this regresses, the log says so without
+            // anyone comparing sizes by hand. A TRUNCATE that leaves the file
+            // large means a reader held the checkpoint off, which is the
+            // failure mode worth seeing.
+            match (before, after) {
+                (Some(b), Some(a)) if a > 8 * 1024 * 1024 && a > b / 2 => tracing::warn!(
+                    before_bytes = b, after_bytes = a,
+                    took_ms = t0.elapsed().as_millis() as u64,
+                    "storage sweep: wal_checkpoint(TRUNCATE) did not shrink the WAL — a \
+                     long-lived reader is holding the checkpoint off (AMUX-4811)"
+                ),
+                _ => tracing::info!(
+                    before_bytes = ?before, after_bytes = ?after,
+                    took_ms = t0.elapsed().as_millis() as u64,
+                    "storage sweep: WAL checkpointed"
+                ),
+            }
+        }
+        Err(e) => tracing::warn!(error = %e, "storage sweep: wal_checkpoint(TRUNCATE) failed"),
+    }
+    (before, after, blocked)
+}
+
 /// VACUUM at most once per day, when the storage sweep actually deleted rows.
 /// Returns true if a VACUUM ran.
 ///
 /// SQLite DELETE frees pages internally but does not shrink the file. Without
 /// VACUUM, the DB file on disk grows monotonically even while the retention
-/// sweep dutifully removes aged rows. Measured 2026-09-09: 2.8 GB on disk,
-/// ~2.1 GB of live data, 82 free pages (essentially zero reclaimable space
-/// because the freelist is continuously reused for new writes). The gap
-/// between the two numbers is what VACUUM recovers.
+/// sweep dutifully removes aged rows. The gap between live data and file size
+/// is what VACUUM recovers.
 ///
-/// Full VACUUM rewrites the entire file, so it is expensive. Once per day is a
-/// compromise: frequent enough that a single day's deletions are reclaimed
-/// before the next day's writes fill the freed pages, infrequent enough that
-/// the ~3 GB rewrite cost is negligible.
-async fn maybe_vacuum(store: &crate::db::SharedStore, home: &Path) -> bool {
+/// DISABLED ON THIS FORK: it never attempts a VACUUM and always returns false,
+/// because no connection the server holds can run one.
+/// - `write_async` wraps every closure in an Immediate transaction, and SQLite
+///   refuses VACUUM inside a transaction. That is where this used to run, so it
+///   never succeeded; it only wrote the `.last-vacuum` marker anyway.
+/// - `read_async` (where upstream 16bf0dd4 moved it) uses the read pool, which
+///   `Store::open` sets `query_only=ON`, so VACUUM fails with "attempt to write
+///   a readonly database" (`vacuum_is_refused_on_the_query_only_read_pool`).
+///
+/// Attempting a write that is certain to fail would, now that the marker is not
+/// written on failure, turn a once-a-day WARN into one on every tick. So it logs
+/// that it skipped and why. The marker is still READ, so an operator who
+/// VACUUMs offline and writes it quiets this for the interval, but it is never
+/// WRITTEN here, because nothing here succeeded. The real fix is a VACUUM on the
+/// writer thread outside any transaction (follow-up card), which must write the
+/// marker only on success.
+async fn maybe_vacuum(home: &Path) -> bool {
     let marker = home.join(".last-vacuum");
     let min_interval = env_u64("AMUX_VACUUM_INTERVAL_SECS", 86_400);
     if min_interval == 0 {
@@ -1053,29 +1157,19 @@ async fn maybe_vacuum(store: &crate::db::SharedStore, home: &Path) -> bool {
             return false;
         }
     }
-    let t0 = std::time::Instant::now();
-    let res = store
-        .write_async(move |conn| {
-            conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")?;
-            conn.execute_batch("VACUUM;")?;
-            Ok(crate::db::WriteOutcome { applied: false, events: vec![] })
-        })
-        .await;
-    let _ = std::fs::write(&marker, format!("{}", unix_now() as i64));
-    match res {
-        Ok(_) => {
-            tracing::info!(
-                took_ms = t0.elapsed().as_millis() as u64,
-                knob = "AMUX_VACUUM_INTERVAL_SECS",
-                "storage sweep: VACUUM completed"
-            );
-            true
-        }
-        Err(e) => {
-            tracing::warn!(error = %e, "storage sweep: VACUUM failed");
-            false
-        }
+    // Once per process: the skip is a standing fact until the writer-thread
+    // VACUUM lands, and repeating it every hourly tick would be noise.
+    static SKIP_LOGGED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if SKIP_LOGGED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        return false;
     }
+    tracing::info!(
+        knob = "AMUX_VACUUM_INTERVAL_SECS",
+        marker = %marker.display(),
+        "storage sweep: VACUUM skipped — no connection can run it (the writer is \
+         transactional and the read pool is query_only); reclaim offline"
+    );
+    false
 }
 
 /// Free bytes on the volume holding `path`.
@@ -1114,6 +1208,13 @@ pub struct StorageReport {
     pub dirs_removed: usize,
     pub dir_bytes_freed: u64,
     pub vacuumed: bool,
+    /// WAL size either side of this tick's checkpoint (AMUX-4811). Both are
+    /// reported so "the WAL is small" and "the checkpoint did not run" are
+    /// different readings, which is the distinction that hid this for a month.
+    pub wal_before_bytes: Option<u64>,
+    pub wal_after_bytes: Option<u64>,
+    /// The checkpoint's own busy verdict (see `checkpoint_wal`).
+    pub wal_checkpoint_blocked: Option<bool>,
     pub rotated_logs_removed: usize,
     pub rotated_logs_freed: u64,
     pub free_bytes: Option<u64>,
@@ -1253,14 +1354,24 @@ pub async fn storage_tick(state: &AppState, home: &Path) -> StorageReport {
     rep.dirs_removed = dirs;
     rep.dir_bytes_freed = dir_bytes;
 
+    // The cheap half, every tick and unconditionally (AMUX-4811). This used to
+    // be reachable only through maybe_vacuum below, so a tick that deleted
+    // nothing never truncated the WAL and it grew until some later tick both
+    // deleted something AND cleared the 24h vacuum interval.
+    let (wal_before, wal_after, wal_blocked) = checkpoint_wal(&state.store).await;
+    rep.wal_checkpoint_blocked = wal_blocked;
+    rep.wal_before_bytes = wal_before;
+    rep.wal_after_bytes = wal_after;
+
     // VACUUM reclaims disk space that DELETE freed inside SQLite but did not
-    // return to the OS. Only run when something was actually deleted, and at
-    // most once per day (the WAL checkpoint is cheap, full VACUUM is not).
+    // return to the OS. Gated on something having been deleted and at most
+    // once per day; currently it only logs that it skipped (see maybe_vacuum).
+    // The WAL checkpoint it used to carry now runs above on its own schedule.
     let total_deleted: usize = rep.tables.iter()
         .filter(|(_, v)| v.contains("Deleted { rows:") && !v.contains("rows: 0"))
         .count();
     if total_deleted > 0 {
-        rep.vacuumed = maybe_vacuum(&state.store, home).await;
+        rep.vacuumed = maybe_vacuum(home).await;
     }
 
     rep.free_bytes = disk_free_bytes(home);
@@ -1352,6 +1463,8 @@ pub async fn debug_storage() -> axum::Json<Value> {
             "diagnostic_dirs": r.diagnostic_dirs,
             "dirs_removed": r.dirs_removed, "dir_bytes_freed": r.dir_bytes_freed,
             "vacuumed": r.vacuumed,
+            "wal_before_bytes": r.wal_before_bytes, "wal_after_bytes": r.wal_after_bytes,
+            "wal_checkpoint_blocked": r.wal_checkpoint_blocked,
             "rotated_logs_removed": r.rotated_logs_removed,
             "rotated_logs_freed": r.rotated_logs_freed,
             "took_ms": r.took_ms,
@@ -1861,5 +1974,220 @@ mod tests {
         let (n, _) = prune_dir_by_age(dir.path(), 0, "AMUX_TEST");
         assert_eq!(n, 0, "0 disables the sweep entirely rather than deleting everything");
         assert!(dir.path().join("fresh.mp4").exists());
+    }
+
+    /// The WAL only shrinks when the checkpoint runs OUTSIDE a transaction,
+    /// which is why `checkpoint_wal` uses `read_async` rather than
+    /// `write_async` (AMUX-4811).
+    ///
+    /// This is the shape that shipped broken for as long as the job existed:
+    /// `write_async` wraps every closure in an Immediate transaction
+    /// (`apply_write` in db/mod.rs), SQLite refuses to checkpoint inside one, and the only
+    /// evidence was a WARN nobody had written yet. A 4.16 GB production
+    /// database was carrying a 143 MB WAL when this was found.
+    ///
+    /// Both arms are asserted on purpose. Without the in-transaction arm this
+    /// test would still pass if someone moved the pragma back under
+    /// `write_async`, because the out-of-transaction arm alone proves only that
+    /// SQLite can truncate, never that the caller lets it.
+    #[test]
+    fn a_wal_checkpoint_only_truncates_outside_a_transaction() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("t.db");
+        let conn = rusqlite::Connection::open(&db).unwrap();
+        conn.pragma_update(None, "journal_mode", "WAL").unwrap();
+        conn.execute_batch("CREATE TABLE t(v BLOB);").unwrap();
+        let blob = vec![b'x'; 8192];
+        for _ in 0..400 {
+            conn.execute("INSERT INTO t(v) VALUES (?1)", [&blob]).unwrap();
+        }
+        let wal = dir.path().join("t.db-wal");
+        let size = || std::fs::metadata(&wal).map(|m| m.len()).unwrap_or(0);
+        let grown = size();
+        assert!(grown > 0, "the fixture must actually produce a WAL to truncate");
+
+        // INSIDE a transaction: refused, exactly as the shipped bug was.
+        let tx = rusqlite::Transaction::new_unchecked(
+            &conn,
+            rusqlite::TransactionBehavior::Immediate,
+        )
+        .unwrap();
+        let refused = tx.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);");
+        assert!(
+            refused.is_err(),
+            "a checkpoint inside a transaction must fail; if SQLite ever allows it, the \
+             comments on checkpoint_wal and maybe_vacuum are wrong and should be corrected"
+        );
+        drop(tx);
+
+        // OUTSIDE one: it truncates.
+        conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);").unwrap();
+        assert!(
+            size() < grown,
+            "checkpoint outside a transaction must shrink the WAL: {} -> {}",
+            grown,
+            size()
+        );
+    }
+
+    /// The test above proves SQLITE's rule. It does NOT prove this module obeys
+    /// it: `checkpoint_wal` could be moved back under `write_async` and it
+    /// would still pass, because it never touches our call sites. That gap is
+    /// the whole defect (a checkpoint that silently never ran), so pin the
+    /// caller too.
+    ///
+    /// `maybe_vacuum` is pinned to NEITHER pool call: both are proven unable to
+    /// VACUUM (`write_async` is transactional, `read_async` is query_only). A
+    /// real fix adds a different path (the writer thread outside a
+    /// transaction), which this test does not block.
+    ///
+    /// Comment lines are excluded deliberately: the fix's own comments say the
+    /// words "write_async" while explaining why not to use it, and a naive grep
+    /// would fail on the corrected code.
+    #[test]
+    fn the_maintenance_paths_call_read_async_not_write_async() {
+        let src = include_str!("storage.rs");
+        let code_of = |func: &str| -> String {
+            let start = src.find(func).unwrap_or_else(|| panic!("{func} not found"));
+            let body = &src[start..];
+            let end = body.find("\n}\n").map(|i| i + 2).unwrap_or(body.len());
+            body[..end]
+                .lines()
+                .filter(|l| !l.trim_start().starts_with("//"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        let code = code_of("async fn checkpoint_wal");
+        assert!(
+            !code.contains(".write_async("),
+            "checkpoint_wal must not run its pragma through write_async: that wraps the \
+             closure in an Immediate transaction (db/mod.rs) and SQLite refuses a checkpoint \
+             inside one. The failure is silent unless someone reads the WARN."
+        );
+        assert!(
+            code.contains(".read_async("),
+            "checkpoint_wal should take a pooled, non-transactional connection via read_async"
+        );
+        let code = code_of("async fn maybe_vacuum");
+        for call in [".write_async(", ".read_async("] {
+            assert!(
+                !code.contains(call),
+                "maybe_vacuum must not VACUUM via {call}: that path cannot run a VACUUM"
+            );
+        }
+    }
+
+    /// Writes ~3 MB through the store's writer so its WAL grows. Returns the
+    /// store and the WAL path beside the database it opened.
+    async fn store_with_a_grown_wal(dir: &Path, name: &str) -> (crate::db::SharedStore, std::path::PathBuf) {
+        let store = std::sync::Arc::new(crate::db::Store::open(&dir.join(name)).unwrap());
+        store
+            .write_async(|conn| {
+                conn.execute_batch("CREATE TABLE wal_fixture(v BLOB);")?;
+                let blob = vec![b'x'; 8192];
+                for _ in 0..400 {
+                    conn.execute("INSERT INTO wal_fixture(v) VALUES (?1)", [&blob])?;
+                }
+                Ok(crate::db::WriteOutcome { applied: false, events: vec![] })
+            })
+            .await
+            .unwrap();
+        (store, dir.join(format!("{name}-wal")))
+    }
+
+    /// The checkpoint we SHIP runs on the store's read pool, whose connections
+    /// are `query_only=ON` on this fork. This proves SQLite allows it there, on
+    /// a real `Store` rather than a raw connection (upstream's test above uses a
+    /// raw one, which is how the pool's flag went unnoticed). The database is
+    /// deliberately NOT named `amux.db`: the WAL must be measured beside the
+    /// database the store opened, as when `AMUX_DB` points elsewhere.
+    #[tokio::test]
+    async fn checkpoint_wal_truncates_through_the_store_read_pool() {
+        let dir = tempfile::tempdir().unwrap();
+        let (store, wal) = store_with_a_grown_wal(dir.path(), "configured-elsewhere.db").await;
+        let query_only: i64 = store
+            .read_async(|c| Ok(c.query_row("PRAGMA query_only", [], |r| r.get(0))?))
+            .await
+            .unwrap();
+        assert_eq!(query_only, 1, "the premise: the read pool is query_only");
+        let grown = std::fs::metadata(&wal).unwrap().len();
+        assert!(grown > 0, "the fixture must actually produce a WAL to truncate");
+
+        let (before, after, blocked) = checkpoint_wal(&store).await;
+        assert_eq!(blocked, Some(false), "an unobstructed TRUNCATE is not blocked");
+        assert!(before.unwrap_or(0) > 0, "the WAL must be measured before: {before:?}");
+        assert_eq!(after, Some(0), "TRUNCATE must empty the WAL: {before:?} -> {after:?}");
+        assert_eq!(std::fs::metadata(&wal).unwrap().len(), 0);
+    }
+
+    /// SQLite reports a checkpoint held off by a reader as busy=1 in its result
+    /// row, not as an error; `execute_batch` threw that row away and the tick
+    /// logged success. An open read transaction on another connection must make
+    /// the checkpoint report `blocked`, and the WAL must not be emptied.
+    #[tokio::test]
+    async fn a_checkpoint_held_off_by_a_reader_reports_blocked() {
+        let dir = tempfile::tempdir().unwrap();
+        let (store, wal) = store_with_a_grown_wal(dir.path(), "t.db").await;
+        // The fixture's inserts trip SQLite's auto-checkpoint, and a reader that
+        // starts on a fully backfilled WAL reads the DB file alone and does NOT
+        // hold TRUNCATE off. So leave a fresh, un-backfilled frame first.
+        store
+            .write_async(|conn| {
+                conn.execute("INSERT INTO wal_fixture(v) VALUES (x'00')", [])?;
+                Ok(crate::db::WriteOutcome { applied: false, events: vec![] })
+            })
+            .await
+            .unwrap();
+        let db = wal.to_string_lossy().trim_end_matches("-wal").to_string();
+        let reader = rusqlite::Connection::open(&db).unwrap();
+        reader.execute_batch("BEGIN;").unwrap();
+        let _: i64 = reader.query_row("SELECT count(*) FROM wal_fixture", [], |r| r.get(0)).unwrap();
+        let (_before, after, blocked) = checkpoint_wal(&store).await;
+        reader.execute_batch("COMMIT;").unwrap();
+        assert_eq!(blocked, Some(true), "a reader-held TRUNCATE must report blocked, not success");
+        assert!(after.unwrap_or(0) > 0, "a blocked TRUNCATE cannot have emptied the WAL: {after:?}");
+    }
+
+    /// Why `maybe_vacuum` does not use the read pool: VACUUM there is refused.
+    /// The control on a plain read-write connection to the SAME file shows the
+    /// refusal comes from the pool's query_only flag, not from VACUUM in
+    /// general. It first asserts the freelist was non-zero, so "0 after" can
+    /// only mean the VACUUM reclaimed it.
+    #[tokio::test]
+    async fn vacuum_is_refused_on_the_query_only_read_pool() {
+        let dir = tempfile::tempdir().unwrap();
+        let (store, _wal) = store_with_a_grown_wal(dir.path(), "t.db").await;
+        store
+            .write_async(|conn| {
+                conn.execute_batch("DELETE FROM wal_fixture;")?;
+                Ok(crate::db::WriteOutcome { applied: false, events: vec![] })
+            })
+            .await
+            .unwrap();
+
+        let refused = store.read_async(|c| Ok(c.execute_batch("VACUUM;")?)).await;
+        let err = refused.expect_err("VACUUM must be refused on the query_only read pool");
+        assert!(err.to_string().contains("readonly"), "unexpected error: {err}");
+
+        let conn = rusqlite::Connection::open(dir.path().join("t.db")).unwrap();
+        let freelist = |c: &rusqlite::Connection| -> i64 {
+            c.query_row("PRAGMA freelist_count", [], |r| r.get(0)).unwrap()
+        };
+        let before = freelist(&conn);
+        assert!(before > 0, "the fixture must leave free pages for VACUUM to reclaim");
+        conn.execute_batch("VACUUM;").unwrap();
+        assert_eq!(freelist(&conn), 0, "a read-write connection VACUUMs: {before} -> 0");
+    }
+
+    /// `maybe_vacuum` must never write `.last-vacuum`, because it never
+    /// VACUUMs. Writing it anyway is the defect that turned a failure into a
+    /// day of silence (AMUX-4811).
+    #[tokio::test]
+    async fn maybe_vacuum_skips_and_never_writes_the_marker() {
+        let home = tempfile::tempdir().unwrap();
+        let marker = home.path().join(".last-vacuum");
+        assert!(!marker.exists());
+        assert!(!maybe_vacuum(home.path()).await, "no VACUUM ran, so it must not claim one");
+        assert!(!marker.exists(), "the marker means a VACUUM succeeded; none did");
     }
 }
