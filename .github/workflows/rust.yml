@@ -33,9 +33,9 @@ on:
     # (23eac180) rather than through a reviewed change — so no PR gated it, and
     # with `cloud/**` absent no PR could have. A test that cannot run when its
     # subject changes does not catch the sweep going the other way.
-    paths: ['crates/**', 'Cargo.toml', 'Cargo.lock', 'e2e/**', 'amux', 'scripts/**', 'cloud/**', 'eslint.config.mjs', '.github/workflows/rust.yml']
+    paths: ['crates/**', 'Cargo.toml', 'Cargo.lock', 'e2e/**', 'amux', 'scripts/**', 'cloud/**', 'eslint.config.mjs', 'tests/**', '.config/nextest.toml', '.github/workflows/rust.yml']
   pull_request:
-    paths: ['crates/**', 'Cargo.toml', 'Cargo.lock', 'e2e/**', 'amux', 'scripts/**', 'cloud/**', 'eslint.config.mjs', '.github/workflows/rust.yml']
+    paths: ['crates/**', 'Cargo.toml', 'Cargo.lock', 'e2e/**', 'amux', 'scripts/**', 'cloud/**', 'eslint.config.mjs', 'tests/**', '.config/nextest.toml', '.github/workflows/rust.yml']
 
 # No group ran the full ~20min check+e2e once per push with nothing
 # superseding anything, so a burst of pushes to main paid full price for
@@ -55,8 +55,19 @@ concurrency:
 env:
   E2E_PROJECTS: desktop mobile
 
+  # Shard count for the Rust tests, in ONE place: test-build turns it into the
+  # test-shards matrix, each shard's --partition denominator, and the count the
+  # aggregate `check` job requires. Change it here only. 2, not 4: the local
+  # trial measured S=520 test-seconds against one 90 s test, and
+  # min(4, ceil(S / (4 x M))) = 2; more shards only add download+extract.
+  NEXTEST_SHARDS: '2'
+  # Must equal nextest-version in .config/nextest.toml, which refuses older.
+  NEXTEST_VERSION: '0.9.145'
+
 jobs:
-  check:
+  # Everything Rust EXCEPT the test run: check, clippy, doctests, CLI smokes.
+  # The tests run in test-build + test-shards; `check` (below) requires all.
+  lint:
     runs-on: ubuntu-latest
     timeout-minutes: 25
     steps:
@@ -94,13 +105,14 @@ jobs:
       # fails the job. Flip to blocking (delete the `if`) once it has been
       # quiet for a few days; leaving it advisory forever would make it
       # decoration.
-      - name: cargo test (workspace) — tree-residue guarded
-        env:
-          AMUX_REQUIRE_TMUX: '1'
+      #
+      # nextest does not run doctests, so they run here, under the same guard.
+      # No tmux in this job: of the smokes below only test-cli-launch-unbound
+      # names tmux, and it puts its own stub first on PATH.
+      - name: cargo test --doc (workspace) — tree-residue guarded
         run: |
           set -uo pipefail
-          command -v tmux >/dev/null || { sudo apt-get update && sudo apt-get install -y tmux; } || exit 1
-          bash scripts/test-tree-clean.sh cargo test --workspace
+          bash scripts/test-tree-clean.sh cargo test --workspace --doc
           rc=$?
           if [ "$rc" = "3" ]; then
             echo "::warning title=Tree residue::A test left residue in the checkout. Advisory during the AF-150 trial period; the diff is above. Fix the FIXTURE, not .gitignore."
@@ -204,6 +216,104 @@ jobs:
       # clean CI tree.
       - name: runtime smoke -- hooks install from HEAD, not the worktree (AMUX-3682)
         run: bash scripts/test-hook-install-from-head.sh
+
+  # Compile the workspace tests ONCE into a nextest archive; the shards run
+  # from it. The single `cargo test` step this replaces was ~16 min of a
+  # ~19 min job, serial across ~70 binaries. Measured locally without DWARF:
+  # a 1.1 GB archive of 77 binaries that extracts to 7.6 GB on each shard.
+  test-build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    outputs:
+      shards: ${{ steps.shards.outputs.shards }}
+    env:
+      # docs/resource-budgets.md: no DWARF for dev/test (as safe-cargo.sh).
+      # Smaller archive for every shard to download; panics keep file:line.
+      CARGO_PROFILE_DEV_DEBUG: '0'
+      CARGO_PROFILE_TEST_DEBUG: '0'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@v2
+        with: { tool: 'cargo-nextest@${{ env.NEXTEST_VERSION }}' }
+      - id: shards
+        run: echo "shards=[$(seq -s, 1 "$NEXTEST_SHARDS")]" >> "$GITHUB_OUTPUT"
+      - name: Build the test archive
+        run: |
+          mkdir -p "$RUNNER_TEMP/nextest"
+          cargo nextest archive --workspace --archive-file "$RUNNER_TEMP/nextest/archive.tar.zst"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: nextest-archive
+          path: ${{ runner.temp }}/nextest/archive.tar.zst
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 1
+
+  test-shards:
+    needs: test-build
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: ${{ fromJSON(needs.test-build.outputs.shards) }}
+    steps:
+      # Each shard needs its own tree: tests read sources via
+      # CARGO_MANIFEST_DIR, and the residue guard snapshots git state.
+      - uses: actions/checkout@v4
+      - uses: taiki-e/install-action@v2
+        with: { tool: 'cargo-nextest@${{ env.NEXTEST_VERSION }}' }
+      - uses: actions/download-artifact@v4
+        with: { name: nextest-archive, path: '${{ runner.temp }}/nextest' }
+      - name: Tree-residue guard — self-test (negative control)
+        run: bash scripts/test-tree-clean.sh --self-test
+      # --extract-to the workspace is REQUIRED, not tidy: sigpipe,
+      # url_resolution and restart_persistence use env!("CARGO_BIN_EXE_*"),
+      # a path baked in at compile time, so the binaries must land at the
+      # target/ test-build compiled into. target/ is gitignored, so the
+      # residue guard does not see the extraction itself.
+      # Residue exit code 3 is advisory, as in the lint job (AF-150).
+      - name: cargo nextest run (shard ${{ matrix.shard }}) — tree-residue guarded
+        env:
+          AMUX_REQUIRE_TMUX: '1'
+        run: |
+          set -uo pipefail
+          command -v tmux >/dev/null || { sudo apt-get update && sudo apt-get install -y tmux; } || exit 1
+          bash scripts/test-tree-clean.sh cargo nextest run --profile ci \
+            --archive-file "$RUNNER_TEMP/nextest/archive.tar.zst" \
+            --workspace-remap "$GITHUB_WORKSPACE" \
+            --extract-to "$GITHUB_WORKSPACE" --extract-overwrite \
+            --partition "slice:${{ matrix.shard }}/$NEXTEST_SHARDS"
+          rc=$?
+          if [ "$rc" = "3" ]; then
+            echo "::warning title=Tree residue::A test left residue in the checkout. Advisory during the AF-150 trial period; the diff is above. Fix the FIXTURE, not .gitignore."
+            exit 0
+          fi
+          exit $rc
+      - uses: actions/upload-artifact@v4
+        if: ${{ !cancelled() }}
+        with:
+          name: nextest-junit-${{ matrix.shard }}
+          path: target/nextest/ci/junit.xml
+          if-no-files-found: error
+          retention-days: 7
+
+  # Preserve the `check` name: it means "every Rust gate is green", as
+  # before the split. A green subset of shards cannot satisfy it.
+  check:
+    needs: [lint, test-build, test-shards]
+    if: ${{ !cancelled() }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Require lint, test-build and every shard to succeed
+        env:
+          RESULTS: ${{ needs.lint.result }} ${{ needs.test-build.result }} ${{ needs.test-shards.result }}
+        run: |
+          echo "lint test-build test-shards: $RESULTS"
+          test "$RESULTS" = "success success success"
 
   e2e-shards:
     # PR Full Gate tier (plan §CI tiers): the golden scenarios in a real
