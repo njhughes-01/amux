@@ -6,6 +6,8 @@
 //! (occurrences++, last_seen moves) instead of inserting a second one, and
 //! recording a pass RESOLVES it. A check firing every 30s for a day is one
 //! incident with 2880 occurrences.
+//! An incident whose subject a still-running check stops reporting for an
+//! hour resolves as `unreported` (A6; see `resolve_unreported`).
 
 use super::{InvariantResult, Status};
 use crate::db::{SharedStore, WriteOutcome};
@@ -28,6 +30,12 @@ const PASS_RETAIN_SECS: f64 = 3600.0;
 /// balloon the WAL past the DB's own size. The monitor cycles constantly, so
 /// a capped trim drains the backlog in hours anyway.
 const TRIM_BATCH_ROWS: i64 = 20_000;
+/// How long an open incident's subject may go unreported by a check that is
+/// still reaching verdicts before the incident resolves as `unreported`. A pass
+/// that reports only part of its entities (a producer skipping one repo or lane
+/// on error) must not close the rest on the spot; an hour of silence while the
+/// same check keeps judging other subjects is the subject being gone.
+const UNREPORTED_GRACE_SECS: f64 = 3600.0;
 
 fn now() -> f64 {
     std::time::SystemTime::now()
@@ -49,6 +57,14 @@ pub async fn record(store: &SharedStore, results: Vec<InvariantResult>, duration
     }
     let opened = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let opened_w = opened.clone();
+    // Invariants that reached a real verdict this pass. Unknown and Skipped are
+    // not verdicts: a check that could not run says nothing about which
+    // subjects still exist, so it must not sweep its incidents.
+    let judged: std::collections::HashSet<String> = results
+        .iter()
+        .filter(|r| matches!(r.status, Status::Pass | Status::Fail))
+        .map(|r| r.invariant_id.clone())
+        .collect();
     let _ = store
         .write_async(move |conn| {
             let ts = now();
@@ -176,6 +192,10 @@ pub async fn record(store: &SharedStore, results: Vec<InvariantResult>, duration
                     )?;
                 }
             }
+            let swept = resolve_unreported(conn, ts, &judged)?;
+            if swept > 0 {
+                tracing::info!(target: "invariants", swept, "invariant incidents resolved as unreported (subject no longer reported)");
+            }
             // Opportunistic trim of the evaluation log only. The predicate is
             // range-bound on ts first so idx_inv_result_ts drives it, and the
             // rowid-IN shape is because DELETE..LIMIT needs a nonstandard
@@ -195,6 +215,43 @@ pub async fn record(store: &SharedStore, results: Vec<InvariantResult>, duration
         })
         .await;
     opened.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Resolve open incidents whose subject a still-judging check stopped reporting
+/// (A6). The only other resolution is a Pass/Unknown for the SAME
+/// (invariant, entity), which a deleted lane or a route that stopped failing
+/// never produces: a lane check enumerates live lanes only, and the route check
+/// emits failing shapes plus one entity-less pass. 22 incidents sat open for
+/// days that way, most for lanes that no longer existed.
+///
+/// Status `unreported`, not `pass`: like `unknown` (AMUX-3575) the row must not
+/// claim the problem healed. A later failure of the same subject reopens it
+/// through the normal upsert.
+fn resolve_unreported(
+    conn: &rusqlite::Connection,
+    ts: f64,
+    judged: &std::collections::HashSet<String>,
+) -> rusqlite::Result<usize> {
+    if judged.is_empty() {
+        return Ok(0);
+    }
+    let stale: Vec<(String, String)> = {
+        let mut stmt = conn.prepare_cached(
+            "SELECT invariant_id, entity_key FROM _amux_invariant_incident
+              WHERE resolved_at IS NULL AND last_seen < ?1",
+        )?;
+        let rows = stmt.query_map([ts - UNREPORTED_GRACE_SECS], |r| Ok((r.get(0)?, r.get(1)?)))?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()?
+    };
+    let mut swept = 0;
+    for (id, entity) in stale.iter().filter(|(id, _)| judged.contains(id)) {
+        swept += conn.execute(
+            "UPDATE _amux_invariant_incident SET resolved_at = ?3, status = 'unreported'
+              WHERE invariant_id = ?1 AND entity_key = ?2 AND resolved_at IS NULL",
+            rusqlite::params![id, entity, ts],
+        )?;
+    }
+    Ok(swept)
 }
 
 /// Live (unresolved) incidents, worst-and-freshest first.
@@ -554,6 +611,73 @@ mod tests {
 
     /// Two entities failing the same check are two incidents — collapsing them
     /// on invariant_id alone would hide the second worker completely.
+    async fn backdate_incidents(s: &SharedStore, secs: f64) {
+        s.write_async(move |c| {
+            c.execute("UPDATE _amux_invariant_incident SET last_seen = last_seen - ?1", [secs])?;
+            Ok(WriteOutcome { applied: true, events: vec![] })
+        })
+        .await
+        .unwrap();
+    }
+
+    fn incident_status(s: &SharedStore, id: &str, entity: &str) -> (String, bool) {
+        s.read()
+            .unwrap()
+            .query_row(
+                "SELECT status, resolved_at IS NOT NULL FROM _amux_invariant_incident
+                  WHERE invariant_id=?1 AND entity_key=?2",
+                [id, entity],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap()
+    }
+
+    /// A6. A deleted lane's incident closes once its check keeps judging (here
+    /// an entity-less pass, what the lane check emits with no live lanes) and
+    /// the subject has been unreported past the grace, and it says so honestly.
+    #[tokio::test]
+    async fn an_unreported_subject_resolves_without_claiming_it_healed() {
+        let (s, _d) = store();
+        record(&s, vec![InvariantResult::fail("x", "a", "b").entity("gone-lane")], 1).await;
+        backdate_incidents(&s, UNREPORTED_GRACE_SECS + 60.0).await;
+        record(&s, vec![InvariantResult::pass("x")], 1).await;
+        assert_eq!(incident_status(&s, "x", "gone-lane"), ("unreported".into(), true));
+        assert!(live_incidents(&s).unwrap().is_empty());
+        // The subject coming back and failing again reopens the same row.
+        record(&s, vec![InvariantResult::fail("x", "a", "b").entity("gone-lane")], 1).await;
+        assert_eq!(incident_status(&s, "x", "gone-lane"), ("fail".into(), false));
+    }
+
+    #[tokio::test]
+    async fn a_check_that_only_reports_unknown_or_skipped_does_not_sweep() {
+        let (s, _d) = store();
+        record(&s, vec![InvariantResult::fail("x", "a", "b").entity("w1")], 1).await;
+        backdate_incidents(&s, UNREPORTED_GRACE_SECS + 60.0).await;
+        record(&s, vec![InvariantResult::unknown("x", "store unreadable")], 1).await;
+        let mut skipped = InvariantResult::pass("x");
+        skipped.status = Status::Skipped;
+        record(&s, vec![skipped], 1).await;
+        assert_eq!(incident_status(&s, "x", "w1"), ("fail".into(), false));
+    }
+
+    #[tokio::test]
+    async fn an_invariant_absent_from_the_pass_keeps_its_incidents() {
+        let (s, _d) = store();
+        record(&s, vec![InvariantResult::fail("x", "a", "b").entity("w1")], 1).await;
+        backdate_incidents(&s, UNREPORTED_GRACE_SECS + 60.0).await;
+        record(&s, vec![InvariantResult::pass("y")], 1).await;
+        assert_eq!(incident_status(&s, "x", "w1"), ("fail".into(), false));
+    }
+
+    #[tokio::test]
+    async fn a_subject_unreported_for_less_than_the_grace_stays_open() {
+        let (s, _d) = store();
+        record(&s, vec![InvariantResult::fail("x", "a", "b").entity("w1")], 1).await;
+        backdate_incidents(&s, UNREPORTED_GRACE_SECS - 60.0).await;
+        record(&s, vec![InvariantResult::fail("x", "a", "b").entity("w2")], 1).await;
+        assert_eq!(incident_status(&s, "x", "w1"), ("fail".into(), false));
+    }
+
     #[tokio::test]
     async fn distinct_entities_are_distinct_incidents() {
         let (s, _d) = store();

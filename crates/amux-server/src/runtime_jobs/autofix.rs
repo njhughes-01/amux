@@ -7360,14 +7360,20 @@ async fn note_resolved_incidents(state: &AppState) -> anyhow::Result<Vec<(String
                 // means it healed; `unknown` means the check STOPPED BEING ABLE
                 // TO RUN, which is not the same claim and must not read as one
                 // (AMUX-3575).
-                let what = if status == "unknown" {
-                    "stopped being checkable"
-                } else {
-                    "resolved"
+                // `unreported` (A6): the check kept running but stopped reporting
+                // this subject (a deleted lane, a route that stopped failing), so
+                // it was not re-judged at all.
+                let (what, how) = match status.as_str() {
+                    "unknown" => ("stopped being checkable", format!("last evaluated {status}")),
+                    "unreported" => (
+                        "stopped being reported by its check (its subject is gone or no longer failing)",
+                        "closed as unreported".to_string(),
+                    ),
+                    _ => ("resolved", format!("last evaluated {status}")),
                 };
                 let line = format!(
                     "[amux autofix] the incident behind this card has {what}: `{inv}` on \
-                     `{entity}` last evaluated {status} at {}. This card was filed \
+                     `{entity}` {how} at {}. This card was filed \
                      automatically from that incident and nothing has re-checked whether the \
                      WORK here is still needed — that call is yours, not mine. Re-check with \
                      GET /api/debug/invariants (latest_per_invariant), where a PASS is visible; \
@@ -13178,7 +13184,7 @@ mod tests {
     /// reassurance one layer up (AMUX-3575).
     #[tokio::test]
     async fn a_resolved_incident_tells_its_card_and_never_closes_it() {
-        for (status, expect_word) in [("pass", "resolved"), ("unknown", "stopped being checkable")]
+        for (status, expect_word) in [("pass", "resolved"), ("unknown", "stopped being checkable"), ("unreported", "stopped being reported by its check (its subject is gone or no longer failing)")]
         {
             let (st, _d) = state();
             let card = "AF-9001";
